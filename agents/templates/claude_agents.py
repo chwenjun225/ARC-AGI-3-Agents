@@ -5,7 +5,7 @@ import textwrap
 from typing import Any, Optional
 
 from arcengine import FrameData, GameAction, GameState
-from claude_agent_sdk import query, ClaudeAgentOptions, AssistantMessage, ToolUseBlock, ResultMessage
+from claude_agent_sdk import query, ClaudeAgentOptions, AssistantMessage, ToolUseBlock, ResultMessage, SystemMessage
 
 from ..agent import Agent
 from ..claude_tools import create_arc_tools_server
@@ -26,12 +26,17 @@ class ClaudeCodeAgent(Agent):
     captured_messages: list[Any]
     current_prompt: str
     result_message: Optional[Any]
+    current_frame: Optional[FrameData]
+    session_id: Optional[str]
     
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
         self.token_counter = 0
         self.step_counter = 0
+        self.cumulative_cost_usd = 0.0
         self.latest_reasoning = ""
+        self.current_frame = None
+        self.session_id = None
         self.mcp_server = create_arc_tools_server(self)
         self.captured_messages = []
         self.current_prompt = ""
@@ -59,17 +64,28 @@ class ClaudeCodeAgent(Agent):
         ])
     
     def build_game_prompt(self, latest_frame: FrameData) -> str:
-        if latest_frame.frame and len(latest_frame.frame) > 0:
-            first_layer = latest_frame.frame[0]
-            grid_str = "\n".join(
-                [" ".join([str(cell).rjust(2) for cell in row]) for row in first_layer]
-            )
-        else:
-            grid_str = "No grid data available"
+        try:
+            if latest_frame.frame and len(latest_frame.frame) > 0:
+                first_layer = latest_frame.frame[0]
+                grid_str = "\n".join(
+                    [" ".join([str(cell).rjust(2) for cell in row]) for row in first_layer]
+                )
+            else:
+                grid_str = "No grid data available"
+                logger.warning("Frame has no grid data")
+        except Exception as e:
+            grid_str = "Error formatting grid data"
+            logger.error(f"Failed to format grid: {e}")
         
-        available_actions_str = ", ".join(
-            [f"ACTION{a}" if a > 0 else "RESET" for a in latest_frame.available_actions]
-        )
+        try:
+            available_actions_str = ", ".join(
+                [f"ACTION{a}" if a > 0 else "RESET" for a in latest_frame.available_actions]
+            )
+            if not available_actions_str:
+                logger.warning("No available actions in frame")
+        except Exception as e:
+            available_actions_str = "ERROR"
+            logger.error(f"Failed to format available actions: {e}")
         
         prompt = textwrap.dedent(f"""
             You are playing an ARC-AGI-3 game. Your goal is to solve the puzzle.
@@ -101,8 +117,11 @@ class ClaudeCodeAgent(Agent):
     async def prompt_generator(self, latest_frame: FrameData):
         game_prompt = self.build_game_prompt(latest_frame)
         yield {
-            "role": "user",
-            "content": game_prompt
+            "type": "user",
+            "message": {
+                "role": "user",
+                "content": game_prompt
+            }
         }
     
     def choose_action(
@@ -111,85 +130,168 @@ class ClaudeCodeAgent(Agent):
         self.step_counter += 1
         logger.info(f"Step {self.step_counter}: Choosing action...")
         
+        self.current_frame = latest_frame
         self.latest_reasoning = ""
         action_taken: Optional[GameAction] = None
         self.captured_messages = []
         self.current_prompt = self.build_game_prompt(latest_frame)
         self.result_message = None
         
-        try:
-            import asyncio
-            loop = asyncio.get_event_loop()
-        except RuntimeError:
-            import asyncio
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
+        import asyncio
+        
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
         
         async def run_query():
             nonlocal action_taken
             
             reasoning_parts = []
+            query_gen = None
             
-            async for message in query(
-                prompt=self.prompt_generator(latest_frame),
-                options=ClaudeAgentOptions(
+            try:
+                options = ClaudeAgentOptions(
                     model=self.MODEL,
                     mcp_servers={"arc-game-tools": self.mcp_server},
                     permission_mode="bypassPermissions",
                 )
-            ):
-                self.captured_messages.append(message)
                 
-                if isinstance(message, ResultMessage):
-                    self.result_message = message
+                if self.session_id:
+                    options.resume = self.session_id
+                    logger.debug(f"Resuming session: {self.session_id}")
                 
-                if isinstance(message, AssistantMessage):
-                    for block in message.content:
-                        if hasattr(block, "text") and block.text:
-                            reasoning_parts.append(block.text)
-                            logger.info(f"Claude reasoning: {block.text[:100]}...")
-                        
-                        if isinstance(block, ToolUseBlock):
-                            tool_name = block.name
-                            logger.info(f"Claude calling tool: {tool_name}")
-                            
-                            if reasoning_parts:
-                                self.latest_reasoning = " ".join(reasoning_parts)
-                            
-                            action_taken = self.parse_action_from_tool(tool_name, block.input)
-                            
-                            if action_taken:
-                                logger.info(f"Parsed action: {action_taken.name}")
-                                return
+                query_gen = query(
+                    prompt=self.prompt_generator(latest_frame),
+                    options=options
+                )
                 
-                if hasattr(message, "usage") and message.usage:
-                    self.track_tokens(message.usage)
+                async for message in query_gen:
+                    self.captured_messages.append(message)
+                    
+                    if isinstance(message, SystemMessage) and message.subtype == 'init':
+                        if not self.session_id:
+                            self.session_id = message.data.get('session_id')
+                            logger.info(f"Session started: {self.session_id}")
+                        else:
+                            resumed_session = message.data.get('session_id')
+                            if resumed_session != self.session_id:
+                                logger.warning(f"Session ID mismatch: expected {self.session_id}, got {resumed_session}")
+                    
+                    if isinstance(message, ResultMessage):
+                        self.result_message = message
+                        if message.is_error:
+                            logger.error(f"ResultMessage indicates error occurred during query")
+                    
+                    if isinstance(message, AssistantMessage) and not action_taken:
+                        for block in message.content:
+                            if hasattr(block, "text") and block.text:
+                                reasoning_parts.append(block.text)
+                                logger.info(f"Claude reasoning: {block.text[:100]}...")
+                            
+                            if isinstance(block, ToolUseBlock):
+                                tool_name = block.name
+                                logger.info(f"Claude calling tool: {tool_name}")
+                                
+                                if reasoning_parts:
+                                    self.latest_reasoning = " ".join(reasoning_parts)
+                                
+                                action_taken = self.parse_action_from_tool(tool_name, block.input)
+                                
+                                if action_taken:
+                                    if latest_frame.available_actions and action_taken.value not in latest_frame.available_actions:
+                                        logger.warning(f"Action {action_taken.name} (value={action_taken.value}) not in available_actions: {latest_frame.available_actions}")
+                                    logger.info(f"Parsed action: {action_taken.name}")
+                                    break
+                                else:
+                                    logger.warning(f"Failed to parse action from tool: {tool_name}")
+            except Exception as e:
+                logger.error(f"Error during query execution: {e}")
+                import traceback
+                logger.debug(traceback.format_exc())
+            finally:
+                if query_gen is not None:
+                    try:
+                        await query_gen.aclose()
+                    except Exception as e:
+                        logger.debug(f"Error closing query generator: {e}")
         
-        loop.run_until_complete(run_query())
+        try:
+            loop.run_until_complete(run_query())
+            
+            pending = asyncio.all_tasks(loop)
+            if pending:
+                logger.debug(f"Waiting for {len(pending)} pending tasks to complete")
+                results = loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+                for i, result in enumerate(results):
+                    if isinstance(result, Exception):
+                        logger.warning(f"Pending task {i} raised exception: {result}")
+        except Exception as e:
+            logger.error(f"Error running event loop: {e}")
+            import traceback
+            logger.debug(traceback.format_exc())
+        finally:
+            try:
+                loop.close()
+            except Exception as e:
+                logger.warning(f"Error closing event loop: {e}")
         
         if action_taken:
+            if not self.latest_reasoning:
+                logger.warning("Action taken but no reasoning captured")
+            
             if self.claude_recorder and not self.is_playback:
                 parsed_action = {
                     "action": action_taken.value,
                     "reasoning": self.latest_reasoning
                 }
                 
-                if self.result_message and hasattr(self.result_message, 'total_cost_usd'):
-                    cost_usd = self.result_message.total_cost_usd
+                cost_usd = 0.0
+                if self.result_message:
+                    if hasattr(self.result_message, 'total_cost_usd') and self.result_message.total_cost_usd is not None:
+                        cost_usd = self.result_message.total_cost_usd
+                        logger.debug(f"Using result_message.total_cost_usd: {cost_usd}")
+                    elif hasattr(self.result_message, 'usage') and self.result_message.usage:
+                        logger.debug(f"Calculating from result_message.usage: {self.result_message.usage}")
+                        try:
+                            cost_usd = self.claude_recorder.calculate_cost_from_usage(self.result_message.usage)
+                            logger.debug(f"Calculated cost: {cost_usd}")
+                        except Exception as e:
+                            logger.error(f"Failed to calculate cost: {e}")
+                    else:
+                        logger.warning("ResultMessage has no cost or usage data")
                 else:
-                    cost_usd = self.claude_recorder.calculate_cost(self.captured_messages)
+                    logger.warning("No ResultMessage captured")
                 
-                self.claude_recorder.save_step(
-                    step=self.step_counter,
-                    prompt=self.current_prompt,
-                    messages=self.captured_messages,
-                    parsed_action=parsed_action,
-                    total_cost_usd=cost_usd
-                )
+                self.cumulative_cost_usd += cost_usd
+                
+                if self.result_message:
+                    try:
+                        self.track_tokens_from_result(self.result_message)
+                    except Exception as e:
+                        logger.error(f"Failed to track tokens: {e}")
+                
+                try:
+                    self.claude_recorder.save_step(
+                        step=self.step_counter,
+                        prompt=self.current_prompt,
+                        messages=self.captured_messages,
+                        parsed_action=parsed_action,
+                        total_cost_usd=cost_usd,
+                        cumulative_cost_usd=self.cumulative_cost_usd
+                    )
+                except Exception as e:
+                    logger.error(f"Failed to save step recording: {e}")
+                    import traceback
+                    logger.debug(traceback.format_exc())
             
             return action_taken
         
         logger.warning("No action was taken by Claude, defaulting to RESET")
+        if not self.captured_messages:
+            logger.error("No messages captured at all - query may have failed completely")
+            if self.session_id:
+                logger.error(f"Session may be corrupted: {self.session_id}")
+        else:
+            logger.warning(f"Captured {len(self.captured_messages)} messages but no valid action found")
         return GameAction.RESET
     
     def parse_action_from_tool(self, tool_name: str, tool_input: dict[str, Any]) -> Optional[GameAction]:
@@ -210,6 +312,11 @@ class ClaudeCodeAgent(Agent):
             if action == GameAction.ACTION6:
                 x = tool_input.get("x", 0)
                 y = tool_input.get("y", 0)
+                
+                if not (0 <= x <= 63 and 0 <= y <= 63):
+                    logger.warning(f"ACTION6 coordinates out of range: x={x}, y={y}")
+                    return None
+                
                 action.action_data.x = x
                 action.action_data.y = y
             
@@ -219,27 +326,37 @@ class ClaudeCodeAgent(Agent):
                 action.action_data.__dict__["reasoning"] = {
                     "text": self.latest_reasoning[:16000]
                 }
+            else:
+                logger.debug("No reasoning captured for action")
             
             return action
         
         logger.warning(f"Unknown tool name: {tool_name}")
         return None
     
-    def track_tokens(self, usage: Any) -> None:
-        if hasattr(usage, "input_tokens"):
-            input_tokens = usage.input_tokens
-            output_tokens = usage.output_tokens
+    def track_tokens_from_result(self, result_message: Any) -> None:
+        if not hasattr(result_message, 'usage') or not result_message.usage:
+            logger.debug("No usage data in ResultMessage")
+            return
+        
+        try:
+            usage = result_message.usage
+            input_tokens = usage.get("input_tokens", 0)
+            output_tokens = usage.get("output_tokens", 0)
+            cached_tokens = usage.get("cache_read_input_tokens", 0)
             total = input_tokens + output_tokens
             self.token_counter += total
             
             logger.info(
-                f"Token usage: +{total} (in: {input_tokens}, out: {output_tokens}), total: {self.token_counter}"
+                f"Token usage: +{total} (in: {input_tokens}, out: {output_tokens}, cached: {cached_tokens}), total: {self.token_counter}"
             )
-            
-            if hasattr(self, "recorder") and not self.is_playback:
-                self.recorder.record({
-                    "tokens": total,
-                    "input_tokens": input_tokens,
-                    "output_tokens": output_tokens,
-                    "total_tokens": self.token_counter,
-                })
+        except Exception as e:
+            logger.error(f"Error tracking tokens: {e}")
+        
+        if hasattr(self, "recorder") and not self.is_playback:
+            self.recorder.record({
+                "tokens": total,
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens,
+                "total_tokens": self.token_counter,
+            })

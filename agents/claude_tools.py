@@ -12,10 +12,10 @@ logger = logging.getLogger()
 
 
 def format_frame_info(agent: "ClaudeCodeAgent") -> str:
-    if not agent.frames:
-        return "No frame data available."
+    latest_frame = agent.current_frame if agent.current_frame else (agent.frames[-1] if agent.frames else None)
     
-    latest_frame = agent.frames[-1]
+    if not latest_frame:
+        return "No frame data available."
     
     available_actions_str = ", ".join(
         [f"ACTION{a}" if a > 0 else "RESET" for a in latest_frame.available_actions]
@@ -23,7 +23,6 @@ def format_frame_info(agent: "ClaudeCodeAgent") -> str:
     
     return json.dumps({
         "state": latest_frame.state.value,
-        "score": latest_frame.score,
         "levels_completed": latest_frame.levels_completed,
         "available_actions": available_actions_str,
     }, indent=2)
