@@ -17,6 +17,7 @@ logger = logging.getLogger()
 class ClaudeCodeAgent(Agent):
     MAX_ACTIONS: int = 80
     MODEL: str = "claude-sonnet-4-5-20250929"
+    MAX_CONSECUTIVE_ERRORS: int = 3
     
     token_counter: int
     step_counter: int
@@ -28,6 +29,7 @@ class ClaudeCodeAgent(Agent):
     result_message: Optional[Any]
     current_frame: Optional[FrameData]
     session_id: Optional[str]
+    consecutive_errors: int
     
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
@@ -37,6 +39,7 @@ class ClaudeCodeAgent(Agent):
         self.latest_reasoning = ""
         self.current_frame = None
         self.session_id = None
+        self.consecutive_errors = 0
         self.mcp_server = create_arc_tools_server(self)
         self.captured_messages = []
         self.current_prompt = ""
@@ -130,6 +133,10 @@ class ClaudeCodeAgent(Agent):
         self.step_counter += 1
         logger.info(f"Step {self.step_counter}: Choosing action...")
         
+        if self.consecutive_errors >= self.MAX_CONSECUTIVE_ERRORS:
+            logger.error(f"FATAL: {self.consecutive_errors} consecutive errors, stopping agent")
+            raise RuntimeError(f"Too many consecutive errors ({self.consecutive_errors}), cannot continue")
+        
         self.current_frame = latest_frame
         self.latest_reasoning = ""
         action_taken: Optional[GameAction] = None
@@ -180,6 +187,8 @@ class ClaudeCodeAgent(Agent):
                         self.result_message = message
                         if message.is_error:
                             logger.error(f"ResultMessage indicates error occurred during query")
+                            if not action_taken:
+                                raise RuntimeError("Query failed with error - check logs for details")
                     
                     if isinstance(message, AssistantMessage) and not action_taken:
                         for block in message.content:
@@ -235,6 +244,7 @@ class ClaudeCodeAgent(Agent):
                 logger.warning(f"Error closing event loop: {e}")
         
         if action_taken:
+            self.consecutive_errors = 0
             if not self.latest_reasoning:
                 logger.warning("Action taken but no reasoning captured")
             
@@ -274,7 +284,8 @@ class ClaudeCodeAgent(Agent):
             
             return action_taken
         
-        logger.warning("No action was taken by Claude, defaulting to RESET")
+        self.consecutive_errors += 1
+        logger.warning(f"No action was taken by Claude (consecutive errors: {self.consecutive_errors}/{self.MAX_CONSECUTIVE_ERRORS}), defaulting to RESET")
         if not self.captured_messages:
             logger.error("No messages captured at all - query may have failed completely")
             if self.session_id:

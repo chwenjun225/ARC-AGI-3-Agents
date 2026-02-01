@@ -5,6 +5,7 @@ description = "ARC-AGI-3-Agents"
 readme = "readme.md"
 requires-python = ">=3.12"
 dependencies = [
+    "anthropic>=0.77.0",
     "arc-agi>=0.9.1",
     "claude-agent-sdk>=0.1.25",
     "dotenv>=0.9.9",
