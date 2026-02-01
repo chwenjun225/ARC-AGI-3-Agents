@@ -110,6 +110,12 @@ class ClaudeCodeAgent(Agent):
             - action5_interact: Execute ACTION5
             - action6_click: Execute ACTION6 with coordinates (x, y) in range 0-63
             - action7_undo: Execute ACTION7 (undo)
+            - read_notes: Read persistent notes about patterns/insights discovered
+            - write_notes: Write persistent notes to remember across turns
+            
+            PERSISTENT MEMORY: You have the option to use read_notes/write_notes to maintain insights across turns.
+            Track patterns, hypotheses, strategies, and what works/doesn't work. 
+            A recommendation is to write the notes upon the initial analysis of the game, if you choose to analyze the game.
             
             Before calling a tool, explain your reasoning. Then call exactly ONE tool.
             Only call tools that are in the available_actions list.

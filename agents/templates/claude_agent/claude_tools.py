@@ -1,5 +1,6 @@
 import json
 import logging
+import os
 from typing import Any, TYPE_CHECKING
 
 from arcengine import FrameData
@@ -239,6 +240,47 @@ def create_arc_tools_server(agent: "ClaudeCodeAgent") -> Any:
             }]
         }
     
+    @tool(
+        "read_notes",
+        "Read the persistent notes about this game session. Contains insights, patterns, and strategies discovered so far.",
+        {}
+    )
+    async def read_notes(args: dict[str, Any]) -> dict[str, Any]:
+        notes_path = f"./game_notes/{agent.game_id}_notes.md"
+        if os.path.exists(notes_path):
+            with open(notes_path, 'r') as f:
+                content = f.read()
+            return {
+                "content": [{
+                    "type": "text",
+                    "text": content if content else "Notes file exists but is empty."
+                }]
+            }
+        return {
+            "content": [{
+                "type": "text",
+                "text": "No notes yet for this game."
+            }]
+        }
+    
+    @tool(
+        "write_notes",
+        "Update the persistent notes file with new insights, patterns, or strategies. This persists across game steps.",
+        {"notes": str}
+    )
+    async def write_notes(args: dict[str, Any]) -> dict[str, Any]:
+        notes_path = f"./game_notes/{agent.game_id}_notes.md"
+        os.makedirs("./game_notes", exist_ok=True)
+        notes_content = args.get("notes", "")
+        with open(notes_path, 'w') as f:
+            f.write(notes_content)
+        return {
+            "content": [{
+                "type": "text",
+                "text": f"Notes saved successfully ({len(notes_content)} characters)."
+            }]
+        }
+    
     return create_sdk_mcp_server(
         name="arc-game-tools",
         version="1.0.0",
@@ -251,5 +293,7 @@ def create_arc_tools_server(agent: "ClaudeCodeAgent") -> Any:
             action5_interact,
             action6_click,
             action7_undo,
+            read_notes,
+            write_notes,
         ]
     )
