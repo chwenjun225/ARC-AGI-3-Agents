@@ -340,6 +340,15 @@ class ClaudeCodeAgent(Agent):
         return GameAction.RESET
     
     def parse_action_from_tool(self, tool_name: str, tool_input: dict[str, Any]) -> Optional[GameAction]:
+        non_action_tools = {
+            "mcp__arc-game-tools__read_notes",
+            "mcp__arc-game-tools__write_notes",
+        }
+        
+        if tool_name in non_action_tools:
+            logger.debug(f"Called utility tool: {tool_name} (non-game-action)")
+            return None
+        
         tool_map = {
             "mcp__arc-game-tools__reset_game": GameAction.RESET,
             "mcp__arc-game-tools__action1_move_up": GameAction.ACTION1,
