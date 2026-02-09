@@ -69,7 +69,7 @@ class SimpleMemoryCarryover(Agent):
         tool_actions = self._locked_available_actions or available_actions
         fallback_action = self._deterministic_fallback_action(latest_frame)
         system_prompt = self._build_system_prompt(tool_actions)
-        user_prompt = self._build_user_prompt(latest_frame, tool_actions)
+        user_prompt = self._build_user_prompt(latest_frame)
         memory_before = self.carryover_memory
         response: Any | None = None
         request_payload: dict[str, Any] | None = None
@@ -176,13 +176,17 @@ class SimpleMemoryCarryover(Agent):
             return action
 
     def _build_system_prompt(self, available_actions: list[GameAction]) -> str:
-        choose_rule = "Choose exactly one action from AVAILABLE_ACTIONS."
+        choose_rule = "Choose exactly one action from PERSISTENT_AVAILABLE_ACTIONS."
         action6_available = GameAction.ACTION6 in available_actions
+        available_names = [action.name for action in available_actions]
+        available_actions_block = "\n".join(
+            f"- {name}" for name in available_names
+        ) or "- <none>"
         coordinate_rule = ""
         if action6_available:
             coordinate_rule = (
                 "- If you choose ACTION6, provide x and y "
-                "(both integers in [0,63])."
+                "(both integers in [0,63]). where (0,0) refers to the top left"
             )
         return textwrap.dedent(
             """
@@ -194,6 +198,9 @@ Critical memory constraint:
 - The text you return in memory_for_next_turn fully replaces prior memory.
 - If you would like to compare the current state to the previous state, you have to store all relevant information about the current state in your memory for use during your next turn.
 
+PERSISTENT_AVAILABLE_ACTIONS (constant for this game):
+{available_actions_block}
+
 Action rules:
 - {choose_rule}
 {coordinate_rule}
@@ -201,34 +208,28 @@ Action rules:
 Output rules:
 - You must reply by calling submit_action_and_memory exactly once.
             """.format(
+                available_actions_block=available_actions_block,
                 choose_rule=choose_rule,
                 coordinate_rule=coordinate_rule,
             )
         ).strip()
 
-    def _build_user_prompt(
-        self, latest_frame: FrameData, available_actions: list[GameAction]
-    ) -> str:
+    def _build_user_prompt(self, latest_frame: FrameData) -> str:
         memory_text = self.carryover_memory
-        available_names = [action.name for action in available_actions]
         return textwrap.dedent(
             """
-MEMORY_FROM_PREVIOUS_TURN:
-{memory}
-
 FRAMES:
 {frames}
 
-AVAILABLE_ACTIONS:
-{available_actions}
+MEMORY_FROM_PREVIOUS_TURN:
+{memory}
 
 What action would you like to take?
 Frames are formatted as CSV rows for each grid (comma-separated integer values).
 Also write all memory you want to persist for the next turn in memory_for_next_turn.
             """.format(
-                memory=memory_text,
                 frames=self._pretty_print_3d(latest_frame.frame),
-                available_actions=available_names,
+                memory=memory_text,
             )
         ).strip()
 
@@ -577,6 +578,16 @@ Also write all memory you want to persist for the next turn in memory_for_next_t
             ]
         lines = [
             f"## Turn {turn_index}",
+            "",
+            "### System Prompt",
+            "```text",
+            system_prompt,
+            "```",
+            "",
+            "### User Prompt",
+            "```text",
+            user_prompt,
+            "```",
             "",
             "### API Request (Raw)",
             "```json",

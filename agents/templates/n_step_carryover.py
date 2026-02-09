@@ -18,7 +18,7 @@ class NStepCarryover(SimpleMemoryCarryover):
     N_STEP_WINDOW = 2
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
-        self._turn_history: list[dict[str, str]] = []
+        self._turn_history: list[dict[str, Any]] = []
         super().__init__(*args, **kwargs)
 
     @property
@@ -38,8 +38,12 @@ class NStepCarryover(SimpleMemoryCarryover):
         return action
 
     def _build_system_prompt(self, available_actions: list[GameAction]) -> str:
-        choose_rule = "Choose exactly one action from AVAILABLE_ACTIONS."
+        choose_rule = "Choose exactly one action from PERSISTENT_AVAILABLE_ACTIONS."
         action6_available = GameAction.ACTION6 in available_actions
+        available_names = [action.name for action in available_actions]
+        available_actions_block = "\n".join(
+            f"- {name}" for name in available_names
+        ) or "- <none>"
         coordinate_rule = ""
         if action6_available:
             coordinate_rule = (
@@ -57,6 +61,9 @@ Context rules:
 - You only know what is shown in MEMORY_FROM_PREVIOUS_TURN and PREVIOUS_TURN_WINDOW.
 - PREVIOUS_TURN_WINDOW shows up to {previous_turns_visible} prior turns.
 
+PERSISTENT_AVAILABLE_ACTIONS (constant for this game):
+{available_actions_block}
+
 Action rules:
 - {choose_rule}
 {coordinate_rule}
@@ -65,39 +72,33 @@ Output rules:
 - You must reply by calling submit_action_and_memory exactly once.
             """.format(
                 previous_turns_visible=previous_turns_visible,
+                available_actions_block=available_actions_block,
                 choose_rule=choose_rule,
                 coordinate_rule=coordinate_rule,
             )
         ).strip()
 
-    def _build_user_prompt(
-        self, latest_frame: FrameData, available_actions: list[GameAction]
-    ) -> str:
+    def _build_user_prompt(self, latest_frame: FrameData) -> str:
         memory_text = self.carryover_memory
-        available_names = [action.name for action in available_actions]
 
         return textwrap.dedent(
             """
+FRAMES:
+{frames}
+
 MEMORY_FROM_PREVIOUS_TURN:
 {memory}
 
 PREVIOUS_TURN_WINDOW:
 {previous_turn_window}
 
-FRAMES:
-{frames}
-
-AVAILABLE_ACTIONS:
-{available_actions}
-
 What action would you like to take?
 Frames are formatted as CSV rows for each grid (comma-separated integer values).
 Also write all memory you want to persist for the next turn in memory_for_next_turn.
             """.format(
+                frames=self._pretty_print_3d(latest_frame.frame),
                 memory=memory_text,
                 previous_turn_window=self._format_previous_turn_window(),
-                frames=self._pretty_print_3d(latest_frame.frame),
-                available_actions=available_names,
             )
         ).strip()
 
@@ -105,11 +106,15 @@ Also write all memory you want to persist for the next turn in memory_for_next_t
         if not self._turn_history:
             return "<empty>"
 
-        lines: list[str] = ["(oldest to newest)"]
-        for index, turn in enumerate(self._turn_history, start=1):
+        ordered_turns = sorted(
+            self._turn_history, key=lambda turn: int(turn.get("turn_index", 0))
+        )
+        lines: list[str] = ["(chronological: oldest to newest)"]
+        for turn in ordered_turns:
+            turn_index = int(turn.get("turn_index", 0))
             lines.extend(
                 [
-                    f"Turn {index}:",
+                    f"Turn {turn_index}:",
                     "FRAMES:",
                     turn["frames"],
                     "ACTION_TAKEN:",
@@ -134,6 +139,7 @@ Also write all memory you want to persist for the next turn in memory_for_next_t
 
         self._turn_history.append(
             {
+                "turn_index": self.action_counter,
                 "frames": self._pretty_print_3d(latest_frame.frame) or "<empty>",
                 "action": action_token,
                 "memory": memory_after if memory_after else "<empty>",
