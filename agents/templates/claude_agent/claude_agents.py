@@ -1,12 +1,14 @@
+import asyncio
 import json
 import logging
 import os
 import textwrap
+import traceback
 import uuid
 from typing import Any, Optional
 
 from arcengine import FrameData, GameAction, GameState
-from claude_agent_sdk import query, ClaudeAgentOptions, AssistantMessage, ToolUseBlock, ResultMessage, SystemMessage
+from claude_agent_sdk import ClaudeSDKClient, ClaudeAgentOptions, AssistantMessage, ToolUseBlock, ResultMessage, SystemMessage
 
 from ...agent import Agent
 from .claude_tools import create_arc_tools_server
@@ -66,6 +68,11 @@ class ClaudeCodeAgent(Agent):
         
         logging.getLogger("anthropic").setLevel(logging.CRITICAL)
         logging.getLogger("httpx").setLevel(logging.CRITICAL)
+
+        # Persistent async infrastructure — single Claude Code subprocess for all turns
+        self._loop = asyncio.new_event_loop()
+        self._client: Optional[ClaudeSDKClient] = None
+        self._client_connected = False
     
     @property
     def name(self) -> str:
@@ -91,20 +98,21 @@ class ClaudeCodeAgent(Agent):
         )
         return self._convert_raw_frame_data(raw)
     
-    def build_game_prompt(self, latest_frame: FrameData) -> str:
+    def _format_grid(self, frame: FrameData) -> str:
         try:
-            if latest_frame.frame and len(latest_frame.frame) > 0:
-                first_layer = latest_frame.frame[0]
-                grid_str = "\n".join(
+            if frame.frame and len(frame.frame) > 0:
+                first_layer = frame.frame[0]
+                return "\n".join(
                     [" ".join([str(cell).rjust(2) for cell in row]) for row in first_layer]
                 )
-            else:
-                grid_str = "No grid data available"
-                logger.warning("Frame has no grid data")
+            return ""
         except Exception as e:
-            grid_str = "Error formatting grid data"
             logger.error(f"Failed to format grid: {e}")
-        
+            return ""
+
+    def build_game_prompt(self, frames: list[FrameData], latest_frame: FrameData) -> str:
+        grid_str = self._format_grid(latest_frame) or "No grid data available"
+
         try:
             available_actions_str = ", ".join(
                 [f"ACTION{a}" if a > 0 else "RESET" for a in latest_frame.available_actions]
@@ -114,15 +122,32 @@ class ClaudeCodeAgent(Agent):
         except Exception as e:
             available_actions_str = "ERROR"
             logger.error(f"Failed to format available actions: {e}")
-        
+
+        # Build animation history from all previous frames that have grid data
+        history_frames = [(i, f) for i, f in enumerate(frames) if f.frame and len(f.frame) > 0]
+        animation_section = ""
+        if history_frames:
+            parts = []
+            for idx, (_, f) in enumerate(history_frames):
+                g = self._format_grid(f)
+                if g:
+                    parts.append(f"--- Frame {idx + 1} (State: {f.state.value}, Levels: {f.levels_completed}) ---\n{g}")
+            if parts:
+                animation_section = (
+                    "\n\nAnimation History (all previous frames received, in order):\n"
+                    + "\n\n".join(parts)
+                    + "\n\n--- End of Animation History ---"
+                )
+
         prompt = textwrap.dedent(f"""
             You are playing an ARC-AGI-3 game. Your goal is to solve the puzzle.
-            
+
             Game: {self.game_id}
             Current State: {latest_frame.state.value}
             Levels Completed: {latest_frame.levels_completed}
             Available Actions: {available_actions_str}
-            
+            {animation_section}
+
             Current Grid (64x64, values 0-15):
             {grid_str}
             
@@ -154,16 +179,50 @@ class ClaudeCodeAgent(Agent):
 
         return prompt
     
-    async def prompt_generator(self, latest_frame: FrameData):
-        game_prompt = self.build_game_prompt(latest_frame)
-        yield {
-            "type": "user",
-            "message": {
-                "role": "user",
-                "content": game_prompt
-            }
-        }
-    
+    def _ensure_client_connected(self) -> None:
+        """Connect the ClaudeSDKClient if not already connected.
+
+        Uses a single persistent subprocess across all game turns.
+        """
+        if self._client_connected:
+            return
+
+        async def _connect():
+            # Clean up stale client from a previous failed connection
+            if self._client:
+                try:
+                    await self._client.disconnect()
+                except Exception:
+                    pass
+
+            options = ClaudeAgentOptions(
+                model=self.MODEL,
+                mcp_servers={"arc-game-tools": self.mcp_server},
+                permission_mode="bypassPermissions",
+                cwd=self.notes_dir,
+                tools=["Read", "Edit", "Write"],
+                system_prompt={
+                    "type": "preset",
+                    "preset": "claude_code",
+                    "append": textwrap.dedent("""
+                        IMPORTANT - INTERRUPT BEHAVIOR: After you call a game action tool,
+                        the system will interrupt you to process the action and advance the game.
+                        This is expected and normal — do not try to prevent or work around interrupts.
+                        Each turn, you should:
+                        1. Optionally read/update your notes file for strategy tracking
+                        2. Analyze the current game state
+                        3. Call exactly ONE game action tool
+                        You will then be interrupted, and the next game state will be provided.
+                    """).strip()
+                },
+            )
+            self._client = ClaudeSDKClient(options=options)
+            await self._client.connect()
+            self._client_connected = True
+            logger.info("ClaudeSDKClient connected (persistent subprocess)")
+
+        self._loop.run_until_complete(_connect())
+
     def choose_action(
         self, frames: list[FrameData], latest_frame: FrameData
     ) -> GameAction:
@@ -179,41 +238,24 @@ class ClaudeCodeAgent(Agent):
         self.latest_reasoning_dict = {}
         action_taken: Optional[GameAction] = None
         self.captured_messages = []
-        self.current_prompt = self.build_game_prompt(latest_frame)
+        self.current_prompt = self.build_game_prompt(frames, latest_frame)
         self.result_message = None
-        
-        import asyncio
-        
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        
-        async def run_query():
+
+        # Ensure the persistent client is connected (single subprocess for all turns)
+        self._ensure_client_connected()
+
+        async def _run_turn():
             nonlocal action_taken
-            
             reasoning_parts = []
-            query_gen = None
-            
+
             try:
-                options = ClaudeAgentOptions(
-                    model=self.MODEL,
-                    mcp_servers={"arc-game-tools": self.mcp_server},
-                    permission_mode="bypassPermissions",
-                    cwd=self.notes_dir,
-                    tools=["Read", "Edit", "Write"],
-                )
-                
-                if self.session_id:
-                    options.resume = self.session_id
-                    logger.debug(f"Resuming session: {self.session_id}")
-                
-                query_gen = query(
-                    prompt=self.prompt_generator(latest_frame),
-                    options=options
-                )
-                
-                async for message in query_gen:
+                # Send prompt to the existing persistent session
+                await self._client.query(self.current_prompt)
+
+                # receive_response() yields messages and auto-terminates after ResultMessage
+                async for message in self._client.receive_response():
                     self.captured_messages.append(message)
-                    
+
                     if isinstance(message, SystemMessage) and message.subtype == 'init':
                         if not self.session_id:
                             self.session_id = message.data.get('session_id')
@@ -222,73 +264,59 @@ class ClaudeCodeAgent(Agent):
                             resumed_session = message.data.get('session_id')
                             if resumed_session != self.session_id:
                                 logger.warning(f"Session ID mismatch: expected {self.session_id}, got {resumed_session}")
-                    
+
                     if isinstance(message, ResultMessage):
                         self.result_message = message
                         if message.is_error:
                             logger.error(f"ResultMessage indicates error occurred during query")
-                    
+
                     if isinstance(message, AssistantMessage) and not action_taken:
                         for block in message.content:
                             if hasattr(block, "text") and block.text:
                                 reasoning_parts.append(block.text)
                                 logger.info(f"Claude reasoning: {block.text[:100]}...")
-                                
+
                                 if "credit balance is too low" in block.text.lower():
                                     logger.error("FATAL: Credit balance too low - stopping immediately")
-                                    import os
                                     print("\n" + "="*80)
                                     print("\033[91m" + "ERROR: Insufficient Anthropic API Credits" + "\033[0m")
                                     print("Please add credits to your Anthropic account to continue.")
                                     print("="*80 + "\n")
                                     os._exit(1)
-                            
+
                             if isinstance(block, ToolUseBlock):
                                 tool_name = block.name
                                 logger.info(f"Claude calling tool: {tool_name}")
-                                
+
                                 if reasoning_parts:
                                     self.latest_reasoning = " ".join(reasoning_parts)
-                                
+
                                 action_taken = self.parse_action_from_tool(tool_name, block.input)
 
                                 if action_taken:
                                     if latest_frame.available_actions and action_taken.value not in latest_frame.available_actions:
                                         logger.warning(f"Action {action_taken.name} (value={action_taken.value}) not in available_actions: {latest_frame.available_actions}")
-                                    logger.info(f"Parsed action: {action_taken.name}")
+                                    logger.info(f"Action found: {action_taken.name}, sending interrupt")
+                                    try:
+                                        await self._client.interrupt()
+                                        logger.debug("Interrupt sent successfully")
+                                    except Exception as e:
+                                        logger.debug(f"Interrupt error (may be expected): {e}")
+                                    # Break inner for-loop; outer async-for continues
+                                    # to drain remaining messages until ResultMessage
                                     break
             except Exception as e:
                 if "credit balance" in str(e).lower():
                     raise
                 logger.error(f"Error during query execution: {e}")
-                import traceback
                 logger.debug(traceback.format_exc())
-            finally:
-                if query_gen is not None:
-                    try:
-                        await query_gen.aclose()
-                    except Exception as e:
-                        logger.debug(f"Error closing query generator: {e}")
-        
+                # Mark disconnected so next turn reconnects
+                self._client_connected = False
+
         try:
-            loop.run_until_complete(run_query())
-            
-            pending = asyncio.all_tasks(loop)
-            if pending:
-                logger.debug(f"Waiting for {len(pending)} pending tasks to complete")
-                results = loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
-                for i, result in enumerate(results):
-                    if isinstance(result, Exception):
-                        logger.warning(f"Pending task {i} raised exception: {result}")
+            self._loop.run_until_complete(_run_turn())
         except RuntimeError as e:
             if "credit balance" in str(e).lower():
-                import os
-                for task in asyncio.all_tasks(loop):
-                    task.cancel()
-                try:
-                    loop.run_until_complete(asyncio.gather(*asyncio.all_tasks(loop), return_exceptions=True))
-                except:
-                    pass
                 print("\n" + "="*80)
                 print("\033[91m" + "ERROR: Insufficient Anthropic API Credits" + "\033[0m")
                 print("Please add credits to your Anthropic account to continue.")
@@ -297,26 +325,13 @@ class ClaudeCodeAgent(Agent):
             raise
         except Exception as e:
             if "credit balance" in str(e).lower():
-                import os
-                for task in asyncio.all_tasks(loop):
-                    task.cancel()
-                try:
-                    loop.run_until_complete(asyncio.gather(*asyncio.all_tasks(loop), return_exceptions=True))
-                except:
-                    pass
                 print("\n" + "="*80)
                 print("\033[91m" + "ERROR: Insufficient Anthropic API Credits" + "\033[0m")
                 print("Please add credits to your Anthropic account to continue.")
                 print("="*80 + "\n")
                 os._exit(1)
             logger.error(f"Error running event loop: {e}")
-            import traceback
             logger.debug(traceback.format_exc())
-        finally:
-            try:
-                loop.close()
-            except Exception as e:
-                logger.warning(f"Error closing event loop: {e}")
         
         if action_taken:
             self.consecutive_errors = 0
@@ -369,6 +384,31 @@ class ClaudeCodeAgent(Agent):
             logger.warning(f"Captured {len(self.captured_messages)} messages but no valid action found")
         return GameAction.RESET
     
+    def cleanup(self, scorecard=None):
+        """Clean up the persistent client and event loop."""
+        if self._client_connected and self._client:
+            try:
+                self._loop.run_until_complete(self._client.disconnect())
+                logger.info("ClaudeSDKClient disconnected")
+            except Exception as e:
+                logger.warning(f"Error disconnecting client: {e}")
+            self._client = None
+            self._client_connected = False
+
+        try:
+            pending = asyncio.all_tasks(self._loop)
+            if pending:
+                for task in pending:
+                    task.cancel()
+                self._loop.run_until_complete(
+                    asyncio.gather(*pending, return_exceptions=True)
+                )
+            self._loop.close()
+        except Exception as e:
+            logger.warning(f"Error closing event loop: {e}")
+
+        super().cleanup(scorecard)
+
     def parse_action_from_tool(self, tool_name: str, tool_input: dict[str, Any]) -> Optional[GameAction]:
         tool_map = {
             "mcp__arc-game-tools__reset_game": GameAction.RESET,
