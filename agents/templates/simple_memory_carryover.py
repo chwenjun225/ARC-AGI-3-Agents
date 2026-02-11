@@ -59,7 +59,7 @@ class SimpleMemoryCarryover(Agent):
     USE_IMAGE_INPUT = False
     IMAGE_INPUT_SIZE = 512
 
-    ENABLE_CHAT_LOG = True # Log to a readable .md file
+    ENABLE_CHAT_LOG = False # Log to a readable .md file
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         api_key = os.getenv("OPENROUTER_API_KEY", "").strip()
