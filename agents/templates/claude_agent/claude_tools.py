@@ -53,7 +53,7 @@ def create_arc_tools_server(agent: "ClaudeCodeAgent") -> Any:
                     "type": "text",
                     "text": error_msg
                 }],
-                "isError": True
+                "is_error": True
             }
         
         return {
@@ -76,7 +76,7 @@ def create_arc_tools_server(agent: "ClaudeCodeAgent") -> Any:
                     "type": "text",
                     "text": error_msg
                 }],
-                "isError": True
+                "is_error": True
             }
         
         return {
@@ -99,7 +99,7 @@ def create_arc_tools_server(agent: "ClaudeCodeAgent") -> Any:
                     "type": "text",
                     "text": error_msg
                 }],
-                "isError": True
+                "is_error": True
             }
         
         return {
@@ -122,7 +122,7 @@ def create_arc_tools_server(agent: "ClaudeCodeAgent") -> Any:
                     "type": "text",
                     "text": error_msg
                 }],
-                "isError": True
+                "is_error": True
             }
         
         return {
@@ -145,7 +145,7 @@ def create_arc_tools_server(agent: "ClaudeCodeAgent") -> Any:
                     "type": "text",
                     "text": error_msg
                 }],
-                "isError": True
+                "is_error": True
             }
         
         return {
@@ -168,7 +168,7 @@ def create_arc_tools_server(agent: "ClaudeCodeAgent") -> Any:
                     "type": "text",
                     "text": error_msg
                 }],
-                "isError": True
+                "is_error": True
             }
         
         return {
@@ -194,7 +194,7 @@ def create_arc_tools_server(agent: "ClaudeCodeAgent") -> Any:
                     "type": "text",
                     "text": error_msg
                 }],
-                "isError": True
+                "is_error": True
             }
         
         x = args.get("x", 0)
@@ -206,7 +206,7 @@ def create_arc_tools_server(agent: "ClaudeCodeAgent") -> Any:
                     "type": "text",
                     "text": f"Invalid coordinates: x={x}, y={y}. Must be in range 0-63."
                 }],
-                "isError": True
+                "is_error": True
             }
         
         return {
@@ -229,7 +229,7 @@ def create_arc_tools_server(agent: "ClaudeCodeAgent") -> Any:
                     "type": "text",
                     "text": error_msg
                 }],
-                "isError": True
+                "is_error": True
             }
         
         return {

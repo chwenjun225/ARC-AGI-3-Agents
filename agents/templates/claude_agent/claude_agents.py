@@ -8,7 +8,16 @@ import uuid
 from typing import Any, Optional
 
 from arcengine import FrameData, GameAction, GameState
-from claude_agent_sdk import ClaudeSDKClient, ClaudeAgentOptions, AssistantMessage, ToolUseBlock, ResultMessage, SystemMessage
+from claude_agent_sdk import (
+    ClaudeSDKClient,
+    ClaudeAgentOptions,
+    AssistantMessage,
+    ToolUseBlock,
+    ToolResultBlock,
+    ResultMessage,
+    SystemMessage,
+    UserMessage,
+)
 
 from ...agent import Agent
 from .claude_tools import create_arc_tools_server
@@ -19,8 +28,18 @@ logger = logging.getLogger()
 
 class ClaudeCodeAgent(Agent):
     MAX_ACTIONS: int = int(os.getenv("STEP_COUNT", 80))
-    MODEL: str = "claude-sonnet-4-5-20250929"
+    MODEL: str = "claude-opus-4-6"
     MAX_CONSECUTIVE_ERRORS: int = 3
+    ACTION_TOOL_MAP: dict[str, GameAction] = {
+        "mcp__arc-game-tools__reset_game": GameAction.RESET,
+        "mcp__arc-game-tools__action1_move_up": GameAction.ACTION1,
+        "mcp__arc-game-tools__action2_move_down": GameAction.ACTION2,
+        "mcp__arc-game-tools__action3_move_left": GameAction.ACTION3,
+        "mcp__arc-game-tools__action4_move_right": GameAction.ACTION4,
+        "mcp__arc-game-tools__action5_interact": GameAction.ACTION5,
+        "mcp__arc-game-tools__action6_click": GameAction.ACTION6,
+        "mcp__arc-game-tools__action7_undo": GameAction.ACTION7,
+    }
     
     token_counter: int
     step_counter: int
@@ -34,6 +53,7 @@ class ClaudeCodeAgent(Agent):
     current_frame: Optional[FrameData]
     session_id: Optional[str]
     consecutive_errors: int
+    previous_action_info: Optional[dict[str, str]]
     
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
@@ -45,13 +65,37 @@ class ClaudeCodeAgent(Agent):
         self.current_frame = None
         self.session_id = None
         self.consecutive_errors = 0
+        self.previous_action_info: Optional[dict[str, str]] = None
         self.mcp_server = create_arc_tools_server(self)
         self.notes_session_id = str(uuid.uuid4())
         self.notes_dir = os.path.abspath(f"./game_notes/{self.game_id}_{self.notes_session_id}")
         os.makedirs(self.notes_dir, exist_ok=True)
         self.notes_path = os.path.join(self.notes_dir, "notes.md")
         with open(self.notes_path, 'w') as f:
-            f.write("")
+            f.write(
+                f"# Game {self.game_id}\n"
+                "\n"
+                "## Game Mechanics (carry across levels)\n"
+                "(Record confirmed, general mechanics here. These persist when levels change.)\n"
+                "\n"
+                "## Current Level\n"
+                "\n"
+                "### Hypothesis\n"
+                "(Your current best theory about how THIS level works. Include confidence: LOW/MEDIUM/HIGH. "
+                "Replace — don't append — when you form a better one.)\n"
+                "\n"
+                "### Key Positions\n"
+                "(Important objects, buttons, targets with grid coordinates. Update in place when things move.)\n"
+                "\n"
+                "### Failed Approaches (this level)\n"
+                "(What you tried that didn't work. Be specific so you don't retry it.)\n"
+                "\n"
+                "### Current Plan\n"
+                "(Your step-by-step plan with resource budget. Include how many actions/energy it requires.)\n"
+                "\n"
+                "## Other Notes\n"
+                "(Optional space for any other observations, patterns, or ideas worth remembering.)\n"
+            )
         logger.info(f"Created notes file: {self.notes_path}")
         self.captured_messages = []
         self.current_prompt = ""
@@ -96,19 +140,180 @@ class ClaudeCodeAgent(Agent):
             data=data,
             reasoning=data.get("reasoning", {}),
         )
+        if raw is None:
+            logger.error(
+                "Environment returned no frame for action %s; using last known observation",
+                action.name,
+            )
+            raw = self.arc_env.observation_space if self.arc_env else None
         return self._convert_raw_frame_data(raw)
+
+    def _build_fallback_action(self, latest_frame: Optional[FrameData] = None) -> GameAction:
+        available = latest_frame.available_actions if latest_frame else []
+        action = GameAction.RESET
+        if available and action.value not in available:
+            for action_id in available:
+                try:
+                    candidate = GameAction.from_id(action_id)
+                except ValueError:
+                    logger.warning("Ignoring unknown action id from available_actions: %s", action_id)
+                    continue
+                if candidate != GameAction.ACTION6:
+                    action = candidate
+                    break
+            else:
+                try:
+                    action = GameAction.from_id(available[0])
+                except ValueError:
+                    logger.warning(
+                        "No known fallback action in available_actions=%s; defaulting to RESET",
+                        available,
+                    )
+
+        if action == GameAction.ACTION6:
+            action.set_data({"game_id": self.game_id, "x": 0, "y": 0})
+        else:
+            action.set_data({"game_id": self.game_id})
+        return action
     
     def _format_grid(self, frame: FrameData) -> str:
         try:
             if frame.frame and len(frame.frame) > 0:
-                first_layer = frame.frame[0]
+                # For animated responses, the final layer is the true current state.
+                final_layer = frame.frame[-1]
                 return "\n".join(
-                    [" ".join([str(cell).rjust(2) for cell in row]) for row in first_layer]
+                    [" ".join([str(cell).rjust(2) for cell in row]) for row in final_layer]
                 )
             return ""
         except Exception as e:
             logger.error(f"Failed to format grid: {e}")
             return ""
+
+    def _compute_frame_diff(self, frames: list[FrameData]) -> Optional[dict]:
+        """Compare previous frame's final state with current frame's final state."""
+        if len(frames) < 2:
+            return None
+
+        try:
+            prev_grid = frames[-2].frame[-1]
+            curr_frame = frames[-1]
+            curr_grid = curr_frame.frame[-1]
+        except (IndexError, TypeError):
+            return None
+
+        has_animation = len(curr_frame.frame) > 1
+
+        changes: list[tuple[int, int, int, int]] = []
+        for row in range(min(len(prev_grid), len(curr_grid))):
+            for col in range(min(len(prev_grid[row]), len(curr_grid[row]))):
+                if prev_grid[row][col] != curr_grid[row][col]:
+                    changes.append((row, col, prev_grid[row][col], curr_grid[row][col]))
+
+        return {
+            'has_diff': len(changes) > 0,
+            'has_animation': has_animation,
+            'animation_frames': len(curr_frame.frame),
+            'changes': changes,
+        }
+
+    def _format_sparse_diff(self, changes: list[tuple[int, int, int, int]]) -> str:
+        """Format cell changes as a sparse list, grouping consecutive columns with same transition."""
+        if not changes:
+            return ""
+
+        MAX_DIFF_LINES = 50
+
+        by_row: dict[int, list[tuple[int, int, int]]] = {}
+        for row, col, old_val, new_val in changes:
+            if row not in by_row:
+                by_row[row] = []
+            by_row[row].append((col, old_val, new_val))
+
+        lines: list[str] = []
+        for row in sorted(by_row.keys()):
+            cells = sorted(by_row[row], key=lambda x: x[0])
+            # Group consecutive columns with same old->new transition
+            groups: list[list[tuple[int, int, int]]] = []
+            current_group = [cells[0]]
+            for i in range(1, len(cells)):
+                col, old_v, new_v = cells[i]
+                prev_col, prev_old, prev_new = current_group[-1]
+                if col == prev_col + 1 and old_v == prev_old and new_v == prev_new:
+                    current_group.append(cells[i])
+                else:
+                    groups.append(current_group)
+                    current_group = [cells[i]]
+            groups.append(current_group)
+
+            for group in groups:
+                start_col = group[0][0]
+                end_col = group[-1][0]
+                old_val = group[0][1]
+                new_val = group[0][2]
+                count = len(group)
+                if start_col == end_col:
+                    lines.append(f"  row {row}, col {start_col}: {old_val}->{new_val}")
+                else:
+                    lines.append(f"  row {row}, cols {start_col}-{end_col}: {old_val}->{new_val} ({count} cells)")
+
+        if len(lines) > MAX_DIFF_LINES:
+            truncated = lines[:MAX_DIFF_LINES]
+            truncated.append(f"  ... and {len(lines) - MAX_DIFF_LINES} more change groups")
+            return f"Changed cells ({len(changes)} total):\n" + "\n".join(truncated)
+
+        return f"Changed cells ({len(changes)} total):\n" + "\n".join(lines)
+
+    def _build_previous_action_section(self, frames: list[FrameData]) -> str:
+        """Build the section describing the previous action and its effect on the grid."""
+        if not self.previous_action_info:
+            return ""
+
+        action_name = self.previous_action_info.get("name", "unknown")
+        action_details = self.previous_action_info.get("details", "")
+
+        diff = self._compute_frame_diff(frames)
+        header = f"Your last action: {action_name}{action_details}"
+
+        if diff is None:
+            return f"\n{header}\nResult: (first turn — no prior grid state to compare against)"
+
+        if diff['has_diff']:
+            diff_text = self._format_sparse_diff(diff['changes'])
+            anim_note = f" (with {diff['animation_frames']}-frame animation)" if diff['has_animation'] else ""
+            return f"\n{header}\nResult{anim_note}: State changed.\n{diff_text}"
+        elif diff['has_animation']:
+            return (
+                f"\n{header}\n"
+                f"Result: Produced {diff['animation_frames']}-frame animation but "
+                f"NO change in final grid state. This action did not modify the puzzle."
+            )
+        else:
+            return (
+                f"\n{header}\n"
+                f"Result: No change. The grid is identical to before this action."
+            )
+
+    def _build_action_info(self, action: GameAction) -> dict[str, str]:
+        """Build a dict describing an action for the next turn's prompt."""
+        name_map = {
+            GameAction.RESET: "reset_game",
+            GameAction.ACTION1: "action1_move_up",
+            GameAction.ACTION2: "action2_move_down",
+            GameAction.ACTION3: "action3_move_left",
+            GameAction.ACTION4: "action4_move_right",
+            GameAction.ACTION5: "action5_interact",
+            GameAction.ACTION6: "action6_click",
+            GameAction.ACTION7: "action7_undo",
+        }
+        name = name_map.get(action, f"action_{action.value}")
+        details = ""
+        if action == GameAction.ACTION6:
+            try:
+                data = action.action_data
+                details = f" (x={data.x}, y={data.y})"
+            except Exception:
+                pass
+        return {"name": name, "details": details}
 
     def build_game_prompt(self, frames: list[FrameData], latest_frame: FrameData) -> str:
         grid_str = self._format_grid(latest_frame) or "No grid data available"
@@ -121,7 +326,7 @@ class ClaudeCodeAgent(Agent):
             3: "- action3_move_left: Execute ACTION3",
             4: "- action4_move_right: Execute ACTION4",
             5: "- action5_interact: Execute ACTION5",
-            6: "- action6_click: Execute ACTION6 with coordinates (x, y) in range 0-63",
+            6: "- action6_click: Execute ACTION6 with coordinates (x, y). x: horizontal coordinate (0 = left, 63 = right, range 0-63). y: vertical coordinate (0 = top, 63 = bottom, range 0-63)",
             7: "- action7_undo: Execute ACTION7 (undo)",
         }
         try:
@@ -160,12 +365,15 @@ class ClaudeCodeAgent(Agent):
                     + "\n\n--- End of Animation Frames ---"
                 )
 
+        previous_action_section = self._build_previous_action_section(frames)
+
         prompt = textwrap.dedent(f"""
             You are playing an ARC-AGI-3 game. Your goal is to solve the puzzle.
 
             Game: {self.game_id}
             Current State: {latest_frame.state.value}
             Levels Completed: {latest_frame.levels_completed}
+            {previous_action_section}
             {animation_section}
 
             Current Grid (64x64, values 0-15):
@@ -179,14 +387,41 @@ class ClaudeCodeAgent(Agent):
             Available game action tools (only these are valid this turn):
             {available_tools_str}
 
-            PERSISTENT SCRATCH PAD: You have a notes file at: {self.notes_path}
-            You can use the built-in Read, Edit, and Write tools to manage this file.
-            Recommended workflow each turn:
-            1. First, Read your notes file to recall your previous insights and strategy.
-            2. Then, Edit the notes file to update with any new observations (use targeted edits, don't rewrite the whole file).
-               Use Write only for the initial creation of the notes file.
-            3. Finally, call exactly ONE game action tool to make your move.
-            Only call game action tools that are in the available_actions list.
+            STRUCTURED NOTES: You have a notes file at: {self.notes_path}
+            Use the built-in Read, Edit, and Write tools to manage it. The file has pre-built sections.
+
+            Each turn:
+            1. Read your notes file to recall your strategy and what you know.
+            2. Edit the notes to update with new observations. Use targeted edits to update
+               specific sections IN PLACE — don't append to the bottom, don't rewrite the whole file.
+            3. Call exactly ONE game action tool to make your move.
+
+            Notes structure rules:
+            - "Game Mechanics": General knowledge that applies across ALL levels. When you confirm
+              a mechanic through 2+ consistent observations, record it here. Keep it abstract
+              (e.g., "9-blocks are buttons that shift content") not level-specific.
+            - "Hypothesis": Your single best theory about how the CURRENT level works. REPLACE it
+              when you have a better one — never stack multiple contradictory hypotheses. Include
+              confidence (LOW/MEDIUM/HIGH) and brief evidence for/against.
+            - "Key Positions": Coordinates of important objects. Update in place when things move.
+            - "Failed Approaches": What didn't work this level. Check this BEFORE trying an action
+              to avoid repeating failed strategies.
+            - "Current Plan": Your immediate plan with estimated cost in actions/energy.
+              If cost exceeds remaining budget, revise the plan before executing.
+            - Keep total notes under 80 lines. Prune ruthlessly — remove disproven hypotheses
+              and consolidate verbose entries.
+
+            LEVEL TRANSITIONS: When levels_completed increases (you solved a level!):
+            1. Promote any newly confirmed mechanics to "Game Mechanics".
+            2. Clear the level-specific sections (Hypothesis, Key Positions, Failed Approaches, Plan).
+            3. Spend your first 2-3 actions on the new level OBSERVING — study the grid layout
+               and identify key objects before taking actions. Apply your Game Mechanics knowledge
+               but don't assume the level works identically to the previous one.
+
+            CRITICAL RESET RULES (violation will force quit the game):
+            - Do NOT restart the game.
+            - Do NOT restart the level at the beginning of a level.
+            - Do NOT restart the level twice in a row.
 
             Before calling a game action tool, explain your reasoning.
         """).strip()
@@ -264,7 +499,10 @@ class ClaudeCodeAgent(Agent):
 
         async def _run_turn():
             nonlocal action_taken
-            reasoning_parts = []
+            reasoning_parts: list[str] = []
+            pending_action_tool_use_id: Optional[str] = None
+            pending_action_tool_name: Optional[str] = None
+            pending_action_tool_input: dict[str, Any] = {}
 
             try:
                 # Send prompt to the existing persistent session
@@ -286,7 +524,10 @@ class ClaudeCodeAgent(Agent):
                     if isinstance(message, ResultMessage):
                         self.result_message = message
                         if message.is_error:
-                            logger.error(f"ResultMessage indicates error occurred during query")
+                            logger.error(
+                                "ResultMessage indicates error occurred during query: %s",
+                                getattr(message, "result", "no result payload"),
+                            )
 
                     if isinstance(message, AssistantMessage) and not action_taken:
                         for block in message.content:
@@ -309,20 +550,83 @@ class ClaudeCodeAgent(Agent):
                                 if reasoning_parts:
                                     self.latest_reasoning = " ".join(reasoning_parts)
 
-                                action_taken = self.parse_action_from_tool(tool_name, block.input)
+                                if tool_name in self.ACTION_TOOL_MAP:
+                                    if (
+                                        pending_action_tool_use_id
+                                        and pending_action_tool_use_id != block.id
+                                    ):
+                                        logger.warning(
+                                            "Received additional game action tool call while another is pending; "
+                                            "tracking latest one only (old=%s, new=%s)",
+                                            pending_action_tool_use_id,
+                                            block.id,
+                                        )
+                                    pending_action_tool_use_id = block.id
+                                    pending_action_tool_name = tool_name
+                                    pending_action_tool_input = (
+                                        block.input if isinstance(block.input, dict) else {}
+                                    )
+                                    logger.info(
+                                        "Queued action tool call %s (tool_use_id=%s); waiting for tool_result",
+                                        tool_name,
+                                        block.id,
+                                    )
+                                else:
+                                    logger.debug(f"Non-action tool called: {tool_name}")
 
-                                if action_taken:
-                                    if latest_frame.available_actions and action_taken.value not in latest_frame.available_actions:
-                                        logger.warning(f"Action {action_taken.name} (value={action_taken.value}) not in available_actions: {latest_frame.available_actions}")
-                                    logger.info(f"Action found: {action_taken.name}, sending interrupt")
-                                    try:
-                                        await self._client.interrupt()
-                                        logger.debug("Interrupt sent successfully")
-                                    except Exception as e:
-                                        logger.debug(f"Interrupt error (may be expected): {e}")
-                                    # Break inner for-loop; outer async-for continues
-                                    # to drain remaining messages until ResultMessage
-                                    break
+                    if (
+                        isinstance(message, UserMessage)
+                        and pending_action_tool_use_id
+                        and not action_taken
+                    ):
+                        for block in message.content:
+                            if not isinstance(block, ToolResultBlock):
+                                continue
+                            if block.tool_use_id != pending_action_tool_use_id:
+                                continue
+
+                            if bool(block.is_error):
+                                logger.warning(
+                                    "Ignoring action tool %s (tool_use_id=%s): tool_result returned is_error=True",
+                                    pending_action_tool_name,
+                                    pending_action_tool_use_id,
+                                )
+                                pending_action_tool_use_id = None
+                                pending_action_tool_name = None
+                                pending_action_tool_input = {}
+                                break
+
+                            action_taken = self.parse_action_from_tool(
+                                pending_action_tool_name or "",
+                                pending_action_tool_input,
+                            )
+                            pending_action_tool_use_id = None
+                            pending_action_tool_name = None
+                            pending_action_tool_input = {}
+
+                            if action_taken:
+                                if (
+                                    latest_frame.available_actions
+                                    and action_taken.value not in latest_frame.available_actions
+                                ):
+                                    logger.warning(
+                                        f"Action {action_taken.name} (value={action_taken.value}) "
+                                        f"not in available_actions: {latest_frame.available_actions}"
+                                    )
+                                logger.info(
+                                    "Validated action from successful tool_result: %s; sending interrupt",
+                                    action_taken.name,
+                                )
+                                try:
+                                    await self._client.interrupt()
+                                    logger.debug("Interrupt sent successfully")
+                                except Exception as e:
+                                    logger.debug(f"Interrupt error (may be expected): {e}")
+                            else:
+                                logger.warning(
+                                    "Tool result succeeded but no valid action could be parsed"
+                                )
+                            break
             except Exception as e:
                 if "credit balance" in str(e).lower():
                     raise
@@ -390,9 +694,13 @@ class ClaudeCodeAgent(Agent):
                     import traceback
                     logger.debug(traceback.format_exc())
             
+            self.previous_action_info = self._build_action_info(action_taken)
             return action_taken
-        
+
         self.consecutive_errors += 1
+        if self.result_message and getattr(self.result_message, "is_error", False):
+            logger.warning("Last ResultMessage had is_error=True; forcing Claude client reconnect on next turn")
+            self._client_connected = False
         logger.warning(f"No action was taken by Claude (consecutive errors: {self.consecutive_errors}/{self.MAX_CONSECUTIVE_ERRORS}), defaulting to RESET")
         if not self.captured_messages:
             logger.error("No messages captured at all - query may have failed completely")
@@ -400,8 +708,10 @@ class ClaudeCodeAgent(Agent):
                 logger.error(f"Session may be corrupted: {self.session_id}")
         else:
             logger.warning(f"Captured {len(self.captured_messages)} messages but no valid action found")
-        return GameAction.RESET
-    
+        fallback = self._build_fallback_action(latest_frame)
+        self.previous_action_info = self._build_action_info(fallback)
+        return fallback
+
     def cleanup(self, scorecard=None):
         """Clean up the persistent client and event loop."""
         if self._client_connected and self._client:
@@ -428,19 +738,8 @@ class ClaudeCodeAgent(Agent):
         super().cleanup(scorecard)
 
     def parse_action_from_tool(self, tool_name: str, tool_input: dict[str, Any]) -> Optional[GameAction]:
-        tool_map = {
-            "mcp__arc-game-tools__reset_game": GameAction.RESET,
-            "mcp__arc-game-tools__action1_move_up": GameAction.ACTION1,
-            "mcp__arc-game-tools__action2_move_down": GameAction.ACTION2,
-            "mcp__arc-game-tools__action3_move_left": GameAction.ACTION3,
-            "mcp__arc-game-tools__action4_move_right": GameAction.ACTION4,
-            "mcp__arc-game-tools__action5_interact": GameAction.ACTION5,
-            "mcp__arc-game-tools__action6_click": GameAction.ACTION6,
-            "mcp__arc-game-tools__action7_undo": GameAction.ACTION7,
-        }
-        
-        if tool_name in tool_map:
-            action = tool_map[tool_name]
+        if tool_name in self.ACTION_TOOL_MAP:
+            action = self.ACTION_TOOL_MAP[tool_name]
             
             if self.current_frame and self.current_frame.available_actions:
                 if action.value not in self.current_frame.available_actions:
@@ -455,13 +754,14 @@ class ClaudeCodeAgent(Agent):
                     logger.warning(f"ACTION6 coordinates out of range: x={x}, y={y}")
                     return None
                 
-                action.action_data.x = x
-                action.action_data.y = y
-            
-            action.action_data.game_id = self.game_id
+                action.set_data({"game_id": self.game_id, "x": x, "y": y})
+            else:
+                action.set_data({"game_id": self.game_id})
             
             if self.latest_reasoning:
                 action_label = tool_name.replace("mcp__arc-game-tools__", "")
+                if action == GameAction.ACTION6:
+                    action_label = f"{action_label} (x={tool_input.get('x', 0)}, y={tool_input.get('y', 0)})"
                 thought_text = f"{action_label}\n\n{self.latest_reasoning}"
                 self.latest_reasoning_dict = {
                     "thought": thought_text[:16000]
