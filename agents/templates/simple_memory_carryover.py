@@ -21,10 +21,6 @@ class SimpleMemoryCarryover(Agent):
 
     MAX_ACTIONS = 50
     ACTION6_COORD_RETRY_COUNT = 2
-    GAME_ACTION_PROFILES: dict[str, tuple[GameAction, ...]] = {
-        # Click-only puzzle profile.
-        "ft09": (GameAction.ACTION6, GameAction.RESET),
-    }
     ACTION_MAPPINGS = {
         "RESET": "RESET - Reset current level",
         "ACTION1": "ACTION1 - Up arrow key, W",
@@ -127,7 +123,6 @@ class SimpleMemoryCarryover(Agent):
 
                 action, action_note = self._action_from_arguments(
                     args=args,
-                    latest_frame=latest_frame,
                     fallback_action=fallback_action,
                     available_actions=available_actions,
                 )
@@ -536,7 +531,6 @@ MEMORY_FROM_PREVIOUS_TURN:
     def _action_from_arguments(
         self,
         args: dict[str, Any],
-        latest_frame: FrameData,
         fallback_action: GameAction,
         available_actions: list[GameAction],
     ) -> tuple[GameAction, str]:
@@ -552,7 +546,7 @@ MEMORY_FROM_PREVIOUS_TURN:
             return fallback_action, f"action_not_available={requested_action.name}"
 
         if requested_action.is_complex():
-            x, y = self._parse_coordinates(args, latest_frame)
+            x, y = self._parse_coordinates(args)
             if x is None or y is None:
                 return fallback_action, "invalid_coordinates_for_action6"
             requested_action.set_data({"x": x, "y": y})
@@ -569,9 +563,7 @@ MEMORY_FROM_PREVIOUS_TURN:
             return f"Model selected an unavailable action ({action_note})"
         return None
 
-    def _parse_coordinates(
-        self, args: dict[str, Any], latest_frame: FrameData
-    ) -> tuple[int | None, int | None]:
+    def _parse_coordinates(self, args: dict[str, Any]) -> tuple[int | None, int | None]:
         try:
             x = int(args.get("x"))
             y = int(args.get("y"))
@@ -579,33 +571,7 @@ MEMORY_FROM_PREVIOUS_TURN:
             return None, None
         if not (0 <= x <= 63 and 0 <= y <= 63):
             return None, None
-        max_x, max_y = self._frame_coordinate_limits(latest_frame)
-        if not (0 <= x <= max_x and 0 <= y <= max_y):
-            return None, None
         return x, y
-
-    def _frame_coordinate_limits(self, latest_frame: FrameData) -> tuple[int, int]:
-        grids = getattr(latest_frame, "frame", None) or []
-        if not isinstance(grids, list) or len(grids) == 0:
-            return 63, 63
-
-        first_grid = grids[0]
-        if not isinstance(first_grid, list) or len(first_grid) == 0:
-            return 63, 63
-
-        row_lengths: list[int] = []
-        for row in first_grid:
-            if isinstance(row, list) and len(row) > 0:
-                row_lengths.append(len(row))
-        if not row_lengths:
-            return 63, 63
-
-        # Use the smallest row width to stay within non-rectangular grid safety.
-        width = min(row_lengths)
-        height = len(row_lengths)
-        max_x = max(0, min(63, width - 1))
-        max_y = max(0, min(63, height - 1))
-        return max_x, max_y
 
     def _handle_parse_failure(
         self, fallback_action: GameAction, error: str, response: Any | None = None
@@ -676,7 +642,6 @@ MEMORY_FROM_PREVIOUS_TURN:
             "parse_status": parse_status,
             "action_note": action_note,
             "memory_chars": len(memory_after),
-            # This is what the ARC site displays under Reasoning Log.
             "assistant_response": self._conversation_response_payload(response),
             "parsed_output": parsed_args,
             "tool_args": parsed_args,
@@ -698,30 +663,7 @@ MEMORY_FROM_PREVIOUS_TURN:
                 parsed.append(action)
         if GameAction.RESET not in parsed:
             parsed.append(GameAction.RESET)
-
-        filtered_by_profile = self._filter_actions_by_game_profile(parsed)
-        return filtered_by_profile
-
-    def _filter_actions_by_game_profile(
-        self, actions: list[GameAction]
-    ) -> list[GameAction]:
-        profile = self._game_action_profile()
-        if profile is None:
-            return actions
-
-        filtered = [action for action in actions if action in profile]
-        if filtered:
-            return filtered
-
-        # Fallback if the profile does not match current environment actions.
-        return actions
-
-    def _game_action_profile(self) -> tuple[GameAction, ...] | None:
-        raw_game_id = getattr(self, "game_id", "") or ""
-        game_key = raw_game_id.split("-", 1)[0].strip().lower()
-        if not game_key:
-            return None
-        return self.GAME_ACTION_PROFILES.get(game_key)
+        return parsed
 
     def _deterministic_fallback_action(self, latest_frame: FrameData) -> GameAction:
         available_actions = self._available_actions(latest_frame)
