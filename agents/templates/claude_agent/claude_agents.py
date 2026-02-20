@@ -1,5 +1,4 @@
 import asyncio
-import json
 import logging
 import os
 import textwrap
@@ -9,21 +8,45 @@ from typing import Any, Optional
 
 from arcengine import FrameData, GameAction, GameState
 from claude_agent_sdk import (
-    ClaudeSDKClient,
-    ClaudeAgentOptions,
     AssistantMessage,
-    ToolUseBlock,
-    ToolResultBlock,
+    ClaudeAgentOptions,
+    ClaudeSDKClient,
     ResultMessage,
     SystemMessage,
+    ToolResultBlock,
+    ToolUseBlock,
     UserMessage,
 )
 
 from ...agent import Agent
-from .claude_tools import create_arc_tools_server
 from .claude_recorder import ClaudeCodeRecorder
+from .claude_tools import create_arc_tools_server
 
 logger = logging.getLogger()
+
+
+def select_animation_frames(
+    frames: list[Any], max_frames: int = 7
+) -> list[tuple[int, Any]]:
+    """Select evenly-spaced frames from an animation, always including first and last.
+
+    Returns a list of (original_index, frame_data) tuples.
+    """
+    n = len(frames)
+    if n == 0:
+        return []
+    if n <= max_frames:
+        return [(i, frames[i]) for i in range(n)]
+    # Pick max_frames indices evenly spaced, always including 0 and n-1
+    indices = [round(i * (n - 1) / (max_frames - 1)) for i in range(max_frames)]
+    # Deduplicate while preserving order (can happen with very small n relative to max)
+    seen = set()
+    unique = []
+    for idx in indices:
+        if idx not in seen:
+            seen.add(idx)
+            unique.append(idx)
+    return [(idx, frames[idx]) for idx in unique]
 
 
 class ClaudeCodeAgent(Agent):
@@ -40,7 +63,7 @@ class ClaudeCodeAgent(Agent):
         "mcp__arc-game-tools__action6_click": GameAction.ACTION6,
         "mcp__arc-game-tools__action7_undo": GameAction.ACTION7,
     }
-    
+
     token_counter: int
     step_counter: int
     mcp_server: Any
@@ -54,7 +77,7 @@ class ClaudeCodeAgent(Agent):
     session_id: Optional[str]
     consecutive_errors: int
     previous_action_info: Optional[dict[str, str]]
-    
+
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
         self.token_counter = 0
@@ -68,10 +91,12 @@ class ClaudeCodeAgent(Agent):
         self.previous_action_info: Optional[dict[str, str]] = None
         self.mcp_server = create_arc_tools_server(self)
         self.notes_session_id = str(uuid.uuid4())
-        self.notes_dir = os.path.abspath(f"./game_notes/{self.game_id}_{self.notes_session_id}")
+        self.notes_dir = os.path.abspath(
+            f"./game_notes/{self.game_id}_{self.notes_session_id}"
+        )
         os.makedirs(self.notes_dir, exist_ok=True)
         self.notes_path = os.path.join(self.notes_dir, "notes.md")
-        with open(self.notes_path, 'w') as f:
+        with open(self.notes_path, "w") as f:
             f.write(
                 f"# Game {self.game_id}\n"
                 "\n"
@@ -100,16 +125,16 @@ class ClaudeCodeAgent(Agent):
         self.captured_messages = []
         self.current_prompt = ""
         self.result_message = None
-        
+
         if kwargs.get("record", False):
             self.claude_recorder = ClaudeCodeRecorder(
                 game_id=kwargs.get("game_id", "unknown"),
                 agent_name=self.agent_name,
-                session_id=self.notes_session_id
+                session_id=self.notes_session_id,
             )
         else:
             self.claude_recorder = None
-        
+
         logging.getLogger("anthropic").setLevel(logging.CRITICAL)
         logging.getLogger("httpx").setLevel(logging.CRITICAL)
 
@@ -119,24 +144,28 @@ class ClaudeCodeAgent(Agent):
         self._loop = asyncio.new_event_loop()
         self._client: Optional[ClaudeSDKClient] = None
         self._client_connected = False
-    
+
     @property
     def name(self) -> str:
         sanitized_model_name = self.MODEL.replace("/", "-").replace(":", "-")
         return f"{super().name}.{sanitized_model_name}"
 
     def is_done(self, frames: list[FrameData], latest_frame: FrameData) -> bool:
-        return any([
-            latest_frame.state is GameState.WIN,
-        ])
-    
+        return any(
+            [
+                latest_frame.state is GameState.WIN,
+            ]
+        )
+
     def do_action_request(self, action: GameAction) -> FrameData:
         data = action.action_data.model_dump()
-        
+
         if self.latest_reasoning_dict:
             data["reasoning"] = self.latest_reasoning_dict
-            logger.info(f"Added reasoning to action request: {len(str(self.latest_reasoning_dict))} chars")
-        
+            logger.info(
+                f"Added reasoning to action request: {len(str(self.latest_reasoning_dict))} chars"
+            )
+
         raw = self.arc_env.step(
             action,
             data=data,
@@ -150,7 +179,9 @@ class ClaudeCodeAgent(Agent):
             raw = self.arc_env.observation_space if self.arc_env else None
         return self._convert_raw_frame_data(raw)
 
-    def _build_fallback_action(self, latest_frame: Optional[FrameData] = None) -> GameAction:
+    def _build_fallback_action(
+        self, latest_frame: Optional[FrameData] = None
+    ) -> GameAction:
         available = latest_frame.available_actions if latest_frame else []
         action = GameAction.RESET
         if available and action.value not in available:
@@ -158,7 +189,10 @@ class ClaudeCodeAgent(Agent):
                 try:
                     candidate = GameAction.from_id(action_id)
                 except ValueError:
-                    logger.warning("Ignoring unknown action id from available_actions: %s", action_id)
+                    logger.warning(
+                        "Ignoring unknown action id from available_actions: %s",
+                        action_id,
+                    )
                     continue
                 if candidate != GameAction.ACTION6:
                     action = candidate
@@ -177,14 +211,17 @@ class ClaudeCodeAgent(Agent):
         else:
             action.set_data({"game_id": self.game_id})
         return action
-    
+
     def _format_grid(self, frame: FrameData) -> str:
         try:
             if frame.frame and len(frame.frame) > 0:
                 # For animated responses, the final layer is the true current state.
                 final_layer = frame.frame[-1]
                 return "\n".join(
-                    [" ".join([str(cell).rjust(2) for cell in row]) for row in final_layer]
+                    [
+                        " ".join([str(cell).rjust(2) for cell in row])
+                        for row in final_layer
+                    ]
                 )
             return ""
         except Exception as e:
@@ -212,10 +249,10 @@ class ClaudeCodeAgent(Agent):
                     changes.append((row, col, prev_grid[row][col], curr_grid[row][col]))
 
         return {
-            'has_diff': len(changes) > 0,
-            'has_animation': has_animation,
-            'animation_frames': len(curr_frame.frame),
-            'changes': changes,
+            "has_diff": len(changes) > 0,
+            "has_animation": has_animation,
+            "animation_frames": len(curr_frame.frame),
+            "changes": changes,
         }
 
     def _format_sparse_diff(self, changes: list[tuple[int, int, int, int]]) -> str:
@@ -256,11 +293,15 @@ class ClaudeCodeAgent(Agent):
                 if start_col == end_col:
                     lines.append(f"  row {row}, col {start_col}: {old_val}->{new_val}")
                 else:
-                    lines.append(f"  row {row}, cols {start_col}-{end_col}: {old_val}->{new_val} ({count} cells)")
+                    lines.append(
+                        f"  row {row}, cols {start_col}-{end_col}: {old_val}->{new_val} ({count} cells)"
+                    )
 
         if len(lines) > MAX_DIFF_LINES:
             truncated = lines[:MAX_DIFF_LINES]
-            truncated.append(f"  ... and {len(lines) - MAX_DIFF_LINES} more change groups")
+            truncated.append(
+                f"  ... and {len(lines) - MAX_DIFF_LINES} more change groups"
+            )
             return f"Changed cells ({len(changes)} total):\n" + "\n".join(truncated)
 
         return f"Changed cells ({len(changes)} total):\n" + "\n".join(lines)
@@ -286,11 +327,15 @@ class ClaudeCodeAgent(Agent):
         if diff is None:
             return f"\n{header}\nResult: (first turn — no prior grid state to compare against)"
 
-        if diff['has_diff']:
-            diff_text = self._format_sparse_diff(diff['changes'])
-            anim_note = f" (with {diff['animation_frames']}-frame animation)" if diff['has_animation'] else ""
+        if diff["has_diff"]:
+            diff_text = self._format_sparse_diff(diff["changes"])
+            anim_note = (
+                f" (with {diff['animation_frames']}-frame animation)"
+                if diff["has_animation"]
+                else ""
+            )
             return f"\n{header}\nResult{anim_note}: State changed.\n{diff_text}"
-        elif diff['has_animation']:
+        elif diff["has_animation"]:
             return (
                 f"\n{header}\n"
                 f"Result: Produced {diff['animation_frames']}-frame animation but "
@@ -324,7 +369,9 @@ class ClaudeCodeAgent(Agent):
                 pass
         return {"name": name, "details": details}
 
-    def build_game_prompt(self, frames: list[FrameData], latest_frame: FrameData) -> str:
+    def build_game_prompt(
+        self, frames: list[FrameData], latest_frame: FrameData
+    ) -> str:
         grid_str = self._format_grid(latest_frame) or "No grid data available"
 
         # Build the available tools list dynamically from available_actions
@@ -344,30 +391,43 @@ class ClaudeCodeAgent(Agent):
                 for a in latest_frame.available_actions
                 if a in tool_descriptions
             ]
-            available_tools_str = "\n".join(available_tools_lines) if available_tools_lines else "No actions available"
+            available_tools_str = (
+                "\n".join(available_tools_lines)
+                if available_tools_lines
+                else "No actions available"
+            )
         except Exception as e:
             available_tools_str = "ERROR determining available actions"
             logger.error(f"Failed to format available actions: {e}")
 
         # Show animation frames from the latest API response only (not cumulative history).
         # Each step() returns a single FrameData whose .frame may contain multiple layers
-        # (e.g. 3 frames for an animation). Show all layers from this response.
+        # (e.g. 3 frames for an animation). Show evenly-spaced layers, excluding the last
+        # layer since it is already displayed as the Current Grid below.
         MAX_ANIMATION_FRAMES = 7
         animation_section = ""
         if latest_frame.frame and len(latest_frame.frame) > 1:
             total_layers = len(latest_frame.frame)
-            layers_to_show = latest_frame.frame[-MAX_ANIMATION_FRAMES:]
-            skipped = total_layers - len(layers_to_show)
+            animation_layers = latest_frame.frame[
+                :-1
+            ]  # exclude last; it's the Current Grid
+            selected = select_animation_frames(animation_layers, MAX_ANIMATION_FRAMES)
             parts = []
-            for idx, layer in enumerate(layers_to_show):
-                frame_num = skipped + idx + 1
+            for orig_idx, layer in selected:
+                frame_num = orig_idx + 1
                 grid = "\n".join(
                     [" ".join([str(cell).rjust(2) for cell in row]) for row in layer]
                 )
                 if grid:
-                    parts.append(f"--- Animation Frame {frame_num} of {total_layers} ---\n{grid}")
+                    parts.append(
+                        f"--- Animation Frame {frame_num} of {total_layers} ---\n{grid}"
+                    )
             if parts:
-                truncation_note = f"\n(Showing last {len(layers_to_show)} of {total_layers} frames)\n" if skipped > 0 else ""
+                truncation_note = (
+                    f"\n(Showing {len(selected)} evenly-spaced frames of {total_layers} total; final frame is the Current Grid below)\n"
+                    if len(selected) < total_layers - 1
+                    else ""
+                )
                 animation_section = (
                     f"\n\nAnimation Frames (from latest action response):{truncation_note}\n"
                     + "\n\n".join(parts)
@@ -389,9 +449,10 @@ class ClaudeCodeAgent(Agent):
             {grid_str}
 
             Note: Some actions trigger animations that return multiple frames. When this
-            happens, the animation frames are shown above. If an animation has more than
-            {MAX_ANIMATION_FRAMES} frames, only the last {MAX_ANIMATION_FRAMES} are shown.
-            The Current Grid always reflects the final state.
+            happens, the animation frames are shown above (excluding the final frame, which
+            is the Current Grid). If there are more frames than can be shown, up to
+            {MAX_ANIMATION_FRAMES} evenly-spaced frames are displayed. The Current Grid
+            always reflects the final state.
 
             Available game action tools (only these are valid this turn):
             {available_tools_str}
@@ -440,7 +501,7 @@ class ClaudeCodeAgent(Agent):
             prompt += f"\n\n## Strategy Prompt\n{strategy_prompt}"
 
         return prompt
-    
+
     def _ensure_client_connected(self) -> None:
         """Connect the ClaudeSDKClient if not already connected.
 
@@ -475,7 +536,7 @@ class ClaudeCodeAgent(Agent):
                         2. Analyze the current game state
                         3. Call exactly ONE game action tool
                         You will then be interrupted, and the next game state will be provided.
-                    """).strip()
+                    """).strip(),
                 },
             )
             self._client = ClaudeSDKClient(options=options)
@@ -492,12 +553,18 @@ class ClaudeCodeAgent(Agent):
         logger.info(f"Step {self.step_counter}: Choosing action...")
 
         if self.consecutive_errors >= self.MAX_CONSECUTIVE_ERRORS:
-            logger.error(f"FATAL: {self.consecutive_errors} consecutive errors, stopping agent")
-            raise RuntimeError(f"Too many consecutive errors ({self.consecutive_errors}), cannot continue")
+            logger.error(
+                f"FATAL: {self.consecutive_errors} consecutive errors, stopping agent"
+            )
+            raise RuntimeError(
+                f"Too many consecutive errors ({self.consecutive_errors}), cannot continue"
+            )
 
         # Auto-reset on GAME_OVER without querying Claude (mirrors random agent behavior)
         if latest_frame.state is GameState.GAME_OVER:
-            logger.info(f"GAME_OVER detected — auto-resetting (step {self.step_counter})")
+            logger.info(
+                f"GAME_OVER detected — auto-resetting (step {self.step_counter})"
+            )
             action = GameAction.RESET
             action.reasoning = "Auto-reset: game over state detected"
             self.previous_action_info = self._build_action_info(action)
@@ -530,14 +597,16 @@ class ClaudeCodeAgent(Agent):
                 async for message in self._client.receive_response():
                     self.captured_messages.append(message)
 
-                    if isinstance(message, SystemMessage) and message.subtype == 'init':
+                    if isinstance(message, SystemMessage) and message.subtype == "init":
                         if not self.session_id:
-                            self.session_id = message.data.get('session_id')
+                            self.session_id = message.data.get("session_id")
                             logger.info(f"Session started: {self.session_id}")
                         else:
-                            resumed_session = message.data.get('session_id')
+                            resumed_session = message.data.get("session_id")
                             if resumed_session != self.session_id:
-                                logger.warning(f"Session ID mismatch: expected {self.session_id}, got {resumed_session}")
+                                logger.warning(
+                                    f"Session ID mismatch: expected {self.session_id}, got {resumed_session}"
+                                )
 
                     if isinstance(message, ResultMessage):
                         self.result_message = message
@@ -554,11 +623,19 @@ class ClaudeCodeAgent(Agent):
                                 logger.info(f"Claude reasoning: {block.text[:100]}...")
 
                                 if "credit balance is too low" in block.text.lower():
-                                    logger.error("FATAL: Credit balance too low - stopping immediately")
-                                    print("\n" + "="*80)
-                                    print("\033[91m" + "ERROR: Insufficient Anthropic API Credits" + "\033[0m")
-                                    print("Please add credits to your Anthropic account to continue.")
-                                    print("="*80 + "\n")
+                                    logger.error(
+                                        "FATAL: Credit balance too low - stopping immediately"
+                                    )
+                                    print("\n" + "=" * 80)
+                                    print(
+                                        "\033[91m"
+                                        + "ERROR: Insufficient Anthropic API Credits"
+                                        + "\033[0m"
+                                    )
+                                    print(
+                                        "Please add credits to your Anthropic account to continue."
+                                    )
+                                    print("=" * 80 + "\n")
                                     os._exit(1)
 
                             if isinstance(block, ToolUseBlock):
@@ -582,7 +659,9 @@ class ClaudeCodeAgent(Agent):
                                     pending_action_tool_use_id = block.id
                                     pending_action_tool_name = tool_name
                                     pending_action_tool_input = (
-                                        block.input if isinstance(block.input, dict) else {}
+                                        block.input
+                                        if isinstance(block.input, dict)
+                                        else {}
                                     )
                                     logger.info(
                                         "Queued action tool call %s (tool_use_id=%s); waiting for tool_result",
@@ -625,7 +704,8 @@ class ClaudeCodeAgent(Agent):
                             if action_taken:
                                 if (
                                     latest_frame.available_actions
-                                    and action_taken.value not in latest_frame.available_actions
+                                    and action_taken.value
+                                    not in latest_frame.available_actions
                                 ):
                                     logger.warning(
                                         f"Action {action_taken.name} (value={action_taken.value}) "
@@ -639,7 +719,9 @@ class ClaudeCodeAgent(Agent):
                                     await self._client.interrupt()
                                     logger.debug("Interrupt sent successfully")
                                 except Exception as e:
-                                    logger.debug(f"Interrupt error (may be expected): {e}")
+                                    logger.debug(
+                                        f"Interrupt error (may be expected): {e}"
+                                    )
                             else:
                                 logger.warning(
                                     "Tool result succeeded but no valid action could be parsed"
@@ -657,75 +739,90 @@ class ClaudeCodeAgent(Agent):
             self._loop.run_until_complete(_run_turn())
         except RuntimeError as e:
             if "credit balance" in str(e).lower():
-                print("\n" + "="*80)
-                print("\033[91m" + "ERROR: Insufficient Anthropic API Credits" + "\033[0m")
+                print("\n" + "=" * 80)
+                print(
+                    "\033[91m" + "ERROR: Insufficient Anthropic API Credits" + "\033[0m"
+                )
                 print("Please add credits to your Anthropic account to continue.")
-                print("="*80 + "\n")
+                print("=" * 80 + "\n")
                 os._exit(1)
             raise
         except Exception as e:
             if "credit balance" in str(e).lower():
-                print("\n" + "="*80)
-                print("\033[91m" + "ERROR: Insufficient Anthropic API Credits" + "\033[0m")
+                print("\n" + "=" * 80)
+                print(
+                    "\033[91m" + "ERROR: Insufficient Anthropic API Credits" + "\033[0m"
+                )
                 print("Please add credits to your Anthropic account to continue.")
-                print("="*80 + "\n")
+                print("=" * 80 + "\n")
                 os._exit(1)
             logger.error(f"Error running event loop: {e}")
             logger.debug(traceback.format_exc())
-        
+
         if action_taken:
             self.consecutive_errors = 0
             if not self.latest_reasoning:
                 logger.warning("Action taken but no reasoning captured")
-            
+
             if self.claude_recorder and not self.is_playback:
                 parsed_action = {
                     "action": action_taken.value,
-                    "reasoning": self.latest_reasoning
+                    "reasoning": self.latest_reasoning,
                 }
-                
+
                 cost_usd = 0.0
-                if self.result_message and hasattr(self.result_message, 'total_cost_usd'):
+                if self.result_message and hasattr(
+                    self.result_message, "total_cost_usd"
+                ):
                     cost_usd = self.result_message.total_cost_usd or 0.0
                     logger.debug(f"Cost from API: ${cost_usd:.6f}")
                 else:
                     logger.warning("No total_cost_usd in ResultMessage")
-                
+
                 self.cumulative_cost_usd += cost_usd
-                
+
                 if self.result_message:
                     try:
                         self.track_tokens_from_result(self.result_message)
                     except Exception as e:
                         logger.error(f"Failed to track tokens: {e}")
-                
+
                 try:
                     self.claude_recorder.save_step(
                         step=self.step_counter,
                         prompt=self.current_prompt,
                         messages=self.captured_messages,
                         parsed_action=parsed_action,
-                        total_cost_usd=cost_usd
+                        total_cost_usd=cost_usd,
                     )
                 except Exception as e:
                     logger.error(f"Failed to save step recording: {e}")
                     import traceback
+
                     logger.debug(traceback.format_exc())
-            
+
             self.previous_action_info = self._build_action_info(action_taken)
             return action_taken
 
         self.consecutive_errors += 1
         if self.result_message and getattr(self.result_message, "is_error", False):
-            logger.warning("Last ResultMessage had is_error=True; forcing Claude client reconnect on next turn")
+            logger.warning(
+                "Last ResultMessage had is_error=True; forcing Claude client reconnect on next turn"
+            )
             self._client_connected = False
-        logger.warning(f"No action was taken by Claude (consecutive errors: {self.consecutive_errors}/{self.MAX_CONSECUTIVE_ERRORS}), defaulting to RESET")
+        logger.warning(
+            f"No action was taken by Claude (consecutive errors: {self.consecutive_errors}/{self.MAX_CONSECUTIVE_ERRORS}), defaulting to RESET"
+        )
         if not self.captured_messages:
-            logger.error("No messages captured at all - query may have failed completely")
+            logger.error(
+                "No messages captured at all - query may have failed completely"
+            )
             if self.session_id:
                 logger.error(f"Session may be corrupted: {self.session_id}")
         else:
-            logger.warning(f"Captured {len(self.captured_messages)} messages but no valid action found")
+            logger.warning(
+                f"Captured {len(self.captured_messages)} messages but no valid action found"
+            )
         fallback = self._build_fallback_action(latest_frame)
         self.previous_action_info = self._build_action_info(fallback)
         return fallback
@@ -755,50 +852,56 @@ class ClaudeCodeAgent(Agent):
 
         super().cleanup(scorecard)
 
-    def parse_action_from_tool(self, tool_name: str, tool_input: dict[str, Any]) -> Optional[GameAction]:
+    def parse_action_from_tool(
+        self, tool_name: str, tool_input: dict[str, Any]
+    ) -> Optional[GameAction]:
         if tool_name in self.ACTION_TOOL_MAP:
             action = self.ACTION_TOOL_MAP[tool_name]
-            
+
             if self.current_frame and self.current_frame.available_actions:
                 if action.value not in self.current_frame.available_actions:
-                    logger.warning(f"Rejecting {action.name} (value={action.value}): not in available_actions {self.current_frame.available_actions}")
+                    logger.warning(
+                        f"Rejecting {action.name} (value={action.value}): not in available_actions {self.current_frame.available_actions}"
+                    )
                     return None
-            
+
             if action == GameAction.ACTION6:
                 x = tool_input.get("x", 0)
                 y = tool_input.get("y", 0)
-                
+
                 if not (0 <= x <= 63 and 0 <= y <= 63):
                     logger.warning(f"ACTION6 coordinates out of range: x={x}, y={y}")
                     return None
-                
+
                 action.set_data({"game_id": self.game_id, "x": x, "y": y})
             else:
                 action.set_data({"game_id": self.game_id})
-            
+
             if self.latest_reasoning:
                 action_label = tool_name.replace("mcp__arc-game-tools__", "")
                 if action == GameAction.ACTION6:
                     action_label = f"{action_label} (x={tool_input.get('x', 0)}, y={tool_input.get('y', 0)})"
                 thought_text = f"{action_label}\n\n{self.latest_reasoning}"
-                self.latest_reasoning_dict = {
-                    "thought": thought_text[:16000]
-                }
-                logger.info(f"Prepared reasoning for action ({len(thought_text)} chars)")
+                self.latest_reasoning_dict = {"thought": thought_text[:16000]}
+                logger.info(
+                    f"Prepared reasoning for action ({len(thought_text)} chars)"
+                )
             else:
                 self.latest_reasoning_dict = {}
-                logger.warning("No reasoning captured for action - reasoning logs will not appear in replay")
-            
+                logger.warning(
+                    "No reasoning captured for action - reasoning logs will not appear in replay"
+                )
+
             return action
-        
+
         logger.debug(f"Non-action tool called: {tool_name}")
         return None
-    
+
     def track_tokens_from_result(self, result_message: Any) -> None:
-        if not hasattr(result_message, 'usage') or not result_message.usage:
+        if not hasattr(result_message, "usage") or not result_message.usage:
             logger.debug("No usage data in ResultMessage")
             return
-        
+
         try:
             usage = result_message.usage
             input_tokens = usage.get("input_tokens", 0)
@@ -806,17 +909,19 @@ class ClaudeCodeAgent(Agent):
             cached_tokens = usage.get("cache_read_input_tokens", 0)
             total = input_tokens + output_tokens
             self.token_counter += total
-            
+
             logger.info(
                 f"Token usage: +{total} (in: {input_tokens}, out: {output_tokens}, cached: {cached_tokens}), total: {self.token_counter}"
             )
         except Exception as e:
             logger.error(f"Error tracking tokens: {e}")
-        
+
         if hasattr(self, "recorder") and not self.is_playback:
-            self.recorder.record({
-                "tokens": total,
-                "input_tokens": input_tokens,
-                "output_tokens": output_tokens,
-                "total_tokens": self.token_counter,
-            })
+            self.recorder.record(
+                {
+                    "tokens": total,
+                    "input_tokens": input_tokens,
+                    "output_tokens": output_tokens,
+                    "total_tokens": self.token_counter,
+                }
+            )
