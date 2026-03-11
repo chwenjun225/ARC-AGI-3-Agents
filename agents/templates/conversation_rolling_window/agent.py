@@ -30,7 +30,8 @@ class ConversationRollingWindow(Agent):
     """
 
     MODEL_CONFIG_ID: str = "gpt-5.4-openrouter"
-    MAX_ACTIONS: int = 10
+    MAX_ACTIONS: int = 10  # Fallback only when baseline_actions are unavailable.
+    MAX_ACTIONS_BASELINE_MULTIPLIER: float = 2.0
     MAX_RETRIES: int = 3
     MAX_CONTEXT_LENGTH: int = 100000
     MAX_ANIMATION_FRAMES: int = 7
@@ -52,7 +53,9 @@ class ConversationRollingWindow(Agent):
         agent_cfg, client_cfg, call_cfg = self._load_model_config()
 
         # Agent-level overrides
-        self.MAX_ACTIONS = agent_cfg.get("MAX_ACTIONS", self.MAX_ACTIONS)
+        self.MAX_ACTIONS_BASELINE_MULTIPLIER = agent_cfg.get(
+            "MAX_ACTIONS_BASELINE_MULTIPLIER", self.MAX_ACTIONS_BASELINE_MULTIPLIER
+        )
         self.MAX_CONTEXT_LENGTH = agent_cfg.get(
             "MAX_CONTEXT_LENGTH", self.MAX_CONTEXT_LENGTH
         )
@@ -60,6 +63,31 @@ class ConversationRollingWindow(Agent):
             "MAX_ANIMATION_FRAMES", self.MAX_ANIMATION_FRAMES
         )
         self.MAX_RETRIES = agent_cfg.get("MAX_RETRIES", self.MAX_RETRIES)
+
+        # Per-level action budgets from baseline_actions * multiplier.
+        # MAX_ACTIONS becomes the derived total budget across all levels.
+        baseline_actions = self.arc_env.info.baseline_actions or []
+        if baseline_actions:
+            self._level_action_budgets = [
+                math.ceil(b * self.MAX_ACTIONS_BASELINE_MULTIPLIER)
+                for b in baseline_actions
+            ]
+            self.MAX_ACTIONS = sum(self._level_action_budgets)
+            logger.info(
+                f"{self.game_id} - Per-level action budgets "
+                f"(multiplier={self.MAX_ACTIONS_BASELINE_MULTIPLIER}): "
+                f"baselines={baseline_actions}, "
+                f"budgets={self._level_action_budgets}, "
+                f"total={self.MAX_ACTIONS}"
+            )
+        else:
+            self._level_action_budgets = []
+            logger.info(
+                f"{self.game_id} - No baseline_actions available, "
+                f"using MAX_ACTIONS={self.MAX_ACTIONS}"
+            )
+        self._level_action_counter: int = 0
+        self._last_levels_completed: int = 0
 
         # Call kwargs passed directly to chat.completions.create()
         self.MODEL: str = call_cfg["model"]
@@ -91,7 +119,8 @@ class ConversationRollingWindow(Agent):
         """Load config from model_configs.yaml matching MODEL_CONFIG_ID.
 
         Returns three dicts: (agent_cfg, client_cfg, call_cfg).
-        - agent_cfg:  agent-level settings (MAX_ACTIONS, MAX_CONTEXT_LENGTH, …)
+        - agent_cfg:  agent-level settings
+                      (MAX_ACTIONS_BASELINE_MULTIPLIER, MAX_CONTEXT_LENGTH, …)
         - client_cfg: OpenAI client constructor args (base_url, api_key_env)
         - call_cfg:   kwargs passed directly to chat.completions.create()
                       (model, max_completion_tokens, reasoning_effort, …)
@@ -278,12 +307,39 @@ class ConversationRollingWindow(Agent):
 
     # ── Core loop ────────────────────────────────────────────────────────
 
+    def _sync_level_progress(self, latest_frame: FrameData) -> None:
+        current_level = latest_frame.levels_completed
+        if current_level > self._last_levels_completed:
+            logger.info(
+                f"{self.game_id} - Level advanced: {self._last_levels_completed} -> {current_level}. "
+                f"Resetting level action counter (was {self._level_action_counter})."
+            )
+            self._level_action_counter = 0
+            self._last_levels_completed = current_level
+
     def is_done(self, frames: list[FrameData], latest_frame: FrameData) -> bool:
-        return latest_frame.state is GameState.WIN
+        if latest_frame.state is GameState.WIN:
+            return True
+        # Check per-level action budget
+        if self._level_action_budgets:
+            self._sync_level_progress(latest_frame)
+            level = latest_frame.levels_completed
+            if level < len(self._level_action_budgets):
+                budget = self._level_action_budgets[level]
+                if self._level_action_counter >= budget:
+                    logger.info(
+                        f"{self.game_id} - Exceeded action budget for level {level}: "
+                        f"{self._level_action_counter}/{budget}. Stopping."
+                    )
+                    return True
+        return False
 
     def choose_action(
         self, frames: list[FrameData], latest_frame: FrameData
     ) -> GameAction:
+        self._sync_level_progress(latest_frame)
+        self._level_action_counter += 1
+
         # Reset whenever the environment indicates the game is not currently playable.
         # Show the game-over frame to the model so it sees why it died.
         if latest_frame.state in (GameState.NOT_PLAYED, GameState.GAME_OVER):

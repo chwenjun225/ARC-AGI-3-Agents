@@ -1,6 +1,6 @@
 - name: "gpt-5.4-openrouter"
   agent:
-    MAX_ACTIONS: 2
+    MAX_ACTIONS_BASELINE_MULTIPLIER: 5.0
     MAX_CONTEXT_LENGTH: 175000
   client:
     base_url: "https://openrouter.ai/api/v1"
@@ -11,7 +11,7 @@
 
 - name: "opus-4.6-anthropic"
   agent:
-    MAX_ACTIONS: 2
+    MAX_ACTIONS_BASELINE_MULTIPLIER: 5.0
     MAX_CONTEXT_LENGTH: 100000
   client:
     base_url: "https://api.anthropic.com/v1/"
