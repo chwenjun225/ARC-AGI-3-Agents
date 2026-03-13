@@ -16,6 +16,14 @@ from openai import OpenAI as OpenAIClient
 
 from ...agent import Agent
 from .exceptions import EmptyResponseError
+from .models import (
+    ActionMetadata,
+    CostDetails,
+    InputTokensDetails,
+    OutputTokensDetails,
+    ResponseUsage,
+    calculate_cost,
+)
 from .recording import RunRecord, StepRecord, StepUsage
 
 logger = logging.getLogger()
@@ -50,7 +58,8 @@ class ConversationRollingWindow(Agent):
         self.conversation: list[dict[str, Any]] = []
         self.token_counter: int = 0
 
-        agent_cfg, client_cfg, call_cfg = self._load_model_config()
+        agent_cfg, client_cfg, call_cfg, pricing_cfg = self._load_model_config()
+        self._pricing: dict[str, float] = pricing_cfg
 
         # Agent-level overrides
         self.MAX_ACTIONS_BASELINE_MULTIPLIER = agent_cfg.get(
@@ -115,15 +124,16 @@ class ConversationRollingWindow(Agent):
 
     def _load_model_config(
         self,
-    ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+    ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any], dict[str, float]]:
         """Load config from model_configs.yaml matching MODEL_CONFIG_ID.
 
-        Returns three dicts: (agent_cfg, client_cfg, call_cfg).
-        - agent_cfg:  agent-level settings
-                      (MAX_ACTIONS_BASELINE_MULTIPLIER, MAX_CONTEXT_LENGTH, …)
-        - client_cfg: OpenAI client constructor args (base_url, api_key_env)
-        - call_cfg:   kwargs passed directly to chat.completions.create()
-                      (model, max_completion_tokens, reasoning_effort, …)
+        Returns four dicts: (agent_cfg, client_cfg, call_cfg, pricing_cfg).
+        - agent_cfg:    agent-level settings
+                        (MAX_ACTIONS_BASELINE_MULTIPLIER, MAX_CONTEXT_LENGTH, …)
+        - client_cfg:   OpenAI client constructor args (base_url, api_key_env)
+        - call_cfg:     kwargs passed directly to chat.completions.create()
+                        (model, max_completion_tokens, reasoning_effort, …)
+        - pricing_cfg:  per-million-token pricing (input, output)
 
         Raises ``ValueError`` if the YAML file is missing or no matching entry.
         """
@@ -149,11 +159,12 @@ class ConversationRollingWindow(Agent):
         agent_cfg: dict[str, Any] = dict(raw.get("agent", {}))
         client_cfg: dict[str, Any] = dict(raw.get("client", {}))
         call_cfg: dict[str, Any] = dict(raw.get("call", {}))
+        pricing_cfg: dict[str, float] = dict(raw.get("pricing", {}))
 
         client_cfg.setdefault("base_url", self._DEFAULT_BASE_URL)
         client_cfg.setdefault("api_key_env", self._DEFAULT_API_KEY_ENV)
 
-        return agent_cfg, client_cfg, call_cfg
+        return agent_cfg, client_cfg, call_cfg, pricing_cfg
 
     @property
     def name(self) -> str:
@@ -164,7 +175,7 @@ class ConversationRollingWindow(Agent):
 
     def _build_system_prompt(self) -> str:
         return textwrap.dedent("""\
-            You are playing a game. Your goal is to win. Reply with the exact action. The final action in your reply will be executed next turn. Your reply will be carried to the next turn.
+            You are playing a game. Your goal is to win. Reply with the exact action you want to take. The final action in your reply will be executed next turn. Your entire reply will be carried to the next turn.
         """)
 
     def _get_actions(self, latest_frame: FrameData) -> list[GameAction]:
@@ -398,11 +409,35 @@ class ConversationRollingWindow(Agent):
             )
         )
 
-        # Pass reasoning to the action for submission to the ARC environment
-        if reasoning:
-            action.reasoning = {"response": f"{assistant_text}\n\n{reasoning}"}
-        else:
-            action.reasoning = {"response": assistant_text}
+        # Build ActionMetadata and pass as dict through the reasoning field
+        usage_obj = ResponseUsage(
+            input_tokens=step_usage.prompt_tokens,
+            input_tokens_details=InputTokensDetails(
+                cached_tokens=step_usage.cached_tokens,
+            ),
+            output_tokens=step_usage.completion_tokens,
+            output_tokens_details=OutputTokensDetails(
+                reasoning_tokens=step_usage.reasoning_tokens,
+            ),
+            total_tokens=step_usage.total_tokens,
+        )
+        input_cost = calculate_cost(
+            step_usage.prompt_tokens, self._pricing.get("input", 0.0)
+        )
+        output_cost = calculate_cost(
+            step_usage.completion_tokens, self._pricing.get("output", 0.0)
+        )
+        metadata = ActionMetadata(
+            output=assistant_text,
+            reasoning=reasoning,
+            usage=usage_obj,
+            cost=CostDetails(
+                input_cost=input_cost,
+                output_cost=output_cost,
+                total_cost=input_cost + output_cost,
+            ),
+        )
+        action.reasoning = metadata.model_dump()
 
         return action
 
