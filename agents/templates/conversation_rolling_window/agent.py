@@ -222,8 +222,18 @@ class ConversationRollingWindow(Agent):
         ]
 
         for i, frame in enumerate(frames):
-            frame_text = f"Frame {i}:\n" + "\n".join(f"  {row}" for row in frame)
-            parts.append(frame_text)
+            frame_lines = []
+
+            if self._level_just_advanced and i == len(frames) - 1:
+                frame_lines.append("")
+                frame_lines.append("New Level:")
+                frame_lines.append("")
+                self._level_just_advanced = False
+
+            frame_lines.append(f"Frame {i}:")
+            frame_lines.extend(f"  {row}" for row in frame)
+
+            parts.append("\n".join(frame_lines))
 
         actions_text = self._build_available_actions_text(
             self._get_actions(latest_frame)
@@ -389,14 +399,9 @@ class ConversationRollingWindow(Agent):
             )
 
         # Normal turn: append frame, call the model, parse action
-        frame_content = self.build_frame_content(latest_frame)
-        if self._level_just_advanced:
-            frame_content = (
-                f"Next level - Now on level {latest_frame.levels_completed + 1}\n\n"
-                + frame_content
-            )
-            self._level_just_advanced = False
-        self.conversation.append({"role": "user", "content": frame_content})
+        self.conversation.append(
+            {"role": "user", "content": self.build_frame_content(latest_frame)}
+        )
 
         actions = self._get_actions(latest_frame)
         start = time.monotonic()
