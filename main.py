@@ -1,8 +1,17 @@
 # ruff: noqa: E402
+from pathlib import Path
+import sys
+
+BASE_DIR = Path(__file__).resolve().parent
+PROJECT_ROOT = BASE_DIR.parent
+LOCAL_DEPS = PROJECT_ROOT / ".deps312"
+if LOCAL_DEPS.exists():
+    sys.path.insert(0, str(LOCAL_DEPS))
+
 from dotenv import load_dotenv
 
-load_dotenv(dotenv_path=".env.example")
-load_dotenv(dotenv_path=".env", override=True)
+load_dotenv(dotenv_path=BASE_DIR / ".env.example")
+load_dotenv(dotenv_path=BASE_DIR / ".env", override=True)
 
 import argparse
 import json
@@ -25,6 +34,9 @@ logger = logging.getLogger()
 SCHEME = os.environ.get("SCHEME", "http")
 HOST = os.environ.get("HOST", "localhost")
 PORT = os.environ.get("PORT", 8001)
+os.environ.setdefault("ENVIRONMENTS_DIR", str(PROJECT_ROOT / "environment_files"))
+os.environ.setdefault("MPLCONFIGDIR", "/tmp/matplotlib")
+os.environ.setdefault("RECORDINGS_DIR", str(BASE_DIR / "recordings"))
 
 # Hide standard ports in URL
 if (SCHEME == "http" and str(PORT) == "80") or (

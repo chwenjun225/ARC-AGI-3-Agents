@@ -132,10 +132,11 @@ class Agent(ABC):
 
     def do_action_request(self, action: GameAction) -> FrameData:
         data = action.action_data.model_dump()
+        reasoning = action.reasoning if isinstance(action.reasoning, dict) else {}
         raw = self.arc_env.step(
             action,
             data=data,
-            reasoning=data["reasoning"] if "reasoning" in data else {},
+            reasoning=reasoning,
         )
         return self._convert_raw_frame_data(raw)
 
@@ -148,6 +149,7 @@ class Agent(ABC):
             state=raw.state,
             levels_completed=raw.levels_completed,
             win_levels=raw.win_levels,
+            action_input=raw.action_input,
             guid=raw.guid,
             full_reset=raw.full_reset,
             available_actions=raw.available_actions,
